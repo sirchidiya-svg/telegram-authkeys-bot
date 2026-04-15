@@ -8,6 +8,9 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook")
+PORT = int(os.getenv("PORT", "8443"))
 
 
 def generate_numeric_key(length=8):
@@ -138,8 +141,21 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Run the bot
-    application.run_polling()
+    # Run the bot using webhook if the URL is configured, otherwise use polling.
+    if WEBHOOK_URL:
+        webhook_path = WEBHOOK_PATH.lstrip("/")
+        webhook_url = WEBHOOK_URL.rstrip("/")
+        if webhook_path:
+            webhook_url = f"{webhook_url}/{webhook_path}"
+
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=webhook_path,
+            webhook_url=webhook_url,
+        )
+    else:
+        application.run_polling()
 
 
 if __name__ == "__main__":
