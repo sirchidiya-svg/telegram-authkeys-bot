@@ -1,6 +1,10 @@
 import os
 import random
+import sqlite3
 import string
+from datetime import datetime
+import asyncio
+import sys
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -11,6 +15,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook")
 PORT = int(os.getenv("PORT", "8443"))
+DB_PATH = os.path.join(os.path.dirname(__file__), "authkeys.db")
 
 
 def generate_numeric_key(length=8):
@@ -24,6 +29,47 @@ def generate_alphanumeric_key(length=8):
     return "".join(random.choices(characters, k=length))
 
 
+def init_db() -> None:
+    """Initialize the SQLite database and saved_keys table."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_keys (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                details TEXT NOT NULL,
+                generated_key TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, title)
+            )
+            """
+        )
+        cursor = conn.execute("PRAGMA table_info(saved_keys)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "generated_key" not in columns:
+            conn.execute("ALTER TABLE saved_keys ADD COLUMN generated_key TEXT")
+
+
+def save_record(user_id: int, title: str, details: str, generated_key: str | None = None) -> str:
+    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO saved_keys (user_id, title, details, generated_key, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, title, details, generated_key, created_at),
+        )
+    return created_at
+
+
+def find_record(user_id: int, title: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT details, generated_key, created_at FROM saved_keys WHERE user_id = ? AND title = ?",
+            (user_id, title),
+        )
+        return cursor.fetchone()
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
     welcome_message = """
@@ -34,9 +80,14 @@ Available Commands:
 /alphanumeric - Generate an alphanumeric 8-digit key
 /help - Show this message
 
+/save {title} {details} - Save a key with a title and details
+/find {title} - Retrieve a saved key by title
+
 Example usage:
 /numeric - Gets a key like: 47392615
 /alphanumeric - Gets a key like: K9M2L7X4
+[Reply to a generated key message] /save api1 my-api-key - The bot will extract the generated key and store it with your details.
+/find api1 - Retrieve the saved key for title 'api1'.
 """
     await update.message.reply_text(welcome_message)
 
@@ -83,11 +134,100 @@ Available Commands:
 /alphanumeric - Generate an alphanumeric 8-digit key
 /help - Show this message
 
+/save {title} {details} - Save a key with a title and details
+/find {title} - Retrieve a saved key by title
+
 Example usage:
 /numeric - Gets a key like: 47392615
 /alphanumeric - Gets a key like: K9M2L7X4
+[Reply to a generated key message] /save api1 my-api-key - The bot will extract the generated key and store it with your details.
+/find api1 - Retrieve the saved key for title 'api1'.
 """
     await update.message.reply_text(help_message)
+
+
+def extract_details_from_message(message):
+    """Extract the saved value from a replied-to message."""
+    if not message:
+        return None
+    source = message.text or message.caption or ""
+    if not source:
+        return None
+    
+    # Try to extract between backticks (markdown code formatting)
+    if "`" in source:
+        parts = source.split("`")
+        if len(parts) >= 3:
+            extracted = parts[1].strip()
+            if extracted:
+                return extracted
+    
+    # Fallback: try to extract the last word/token that looks like a key
+    # This handles cases where backticks might not be in the message
+    tokens = source.split()
+    if tokens:
+        # Look for the last token that looks like it could be a key
+        for token in reversed(tokens):
+            token = token.strip()
+            # Check if it looks like a key (alphanumeric, no special chars except - or _)
+            if token and all(c.isalnum() or c in '-_' for c in token) and len(token) >= 4:
+                return token
+    
+    # Last resort: return the whole message
+    result = source.strip()
+    return result if result else None
+
+
+async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text or ""
+    parts = text.split(" ", 2)
+    
+    # Require both title and details
+    if len(parts) < 3 or not parts[1].strip() or not parts[2].strip():
+        await update.message.reply_text(
+            "Usage: /save {title} {details}\nExample: /save api1 my-important-key"
+        )
+        return
+
+    title = parts[1].strip()
+    details = parts[2].strip()
+    generated_key = None
+
+    # If replying to a message, try to extract the generated key
+    if update.message.reply_to_message:
+        generated_key = extract_details_from_message(update.message.reply_to_message)
+
+    user_id = update.effective_user.id
+    created_at = save_record(user_id, title, details, generated_key)
+
+    key_line = f"\n🔑 Generated Key: {generated_key}" if generated_key else ""
+    await update.message.reply_text(
+        f"Saved '{title}'.\nDetails: {details}{key_line}\nCreated: {created_at}"
+    )
+
+
+async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /find {title}\nExample: /find api1")
+        return
+
+    title = args[0].strip()
+    if not title:
+        await update.message.reply_text("Please provide a title to look up.\nUsage: /find {title}")
+        return
+
+    user_id = update.effective_user.id
+    record = find_record(user_id, title)
+    if not record:
+        await update.message.reply_text(f"No saved entry found for title '{title}'.")
+        return
+
+    details, generated_key, created_at = record
+    generated_key_text = generated_key if generated_key else "N/A"
+    await update.message.reply_text(
+        f"Title: {title}\nDetails: {details}\nGenerated key: {generated_key_text}\nSaved: {created_at}"
+    )
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -132,14 +272,30 @@ def main() -> None:
         raise ValueError("TELEGRAM_TOKEN not found in environment variables!")
 
     # Create the Application
+    # Ensure an asyncio event loop exists (fix for newer Python on Windows)
+    try:
+        if sys.platform.startswith("win"):
+            try:
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            except Exception:
+                pass
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     application = Application.builder().token(TOKEN).build()
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("numeric", generate_numeric))
     application.add_handler(CommandHandler("alphanumeric", generate_alphanumeric))
+    application.add_handler(CommandHandler("save", save_command))
+    application.add_handler(CommandHandler("find", find_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
+
+    init_db()
 
     # Run the bot using webhook if the URL is configured, otherwise use polling.
     if WEBHOOK_URL:
