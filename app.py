@@ -206,6 +206,17 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+def build_find_response(title: str, details: str, generated_key: str | None, created_at: str) -> str:
+    """Build a /find response with the generated key formatted for easy copying."""
+    generated_key_text = generated_key if generated_key else "N/A"
+    return (
+        f"Title: {title}\n"
+        f"Details: {details}\n"
+        f"Generated key: `{generated_key_text}`\n"
+        f"Saved: {created_at}"
+    )
+
+
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
@@ -224,10 +235,8 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     details, generated_key, created_at = record
-    generated_key_text = generated_key if generated_key else "N/A"
-    await update.message.reply_text(
-        f"Title: {title}\nDetails: {details}\nGenerated key: {generated_key_text}\nSaved: {created_at}"
-    )
+    response = build_find_response(title, details, generated_key, created_at)
+    await update.message.reply_text(response, parse_mode="Markdown")
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
