@@ -73,7 +73,10 @@ SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "100"))  # 
 TELEGRAM_CONTACT_USERNAME = "sirchidiya"
 TELEGRAM_CONTACT_URL = f"https://t.me/{TELEGRAM_CONTACT_USERNAME}"
 # Set this to wherever you host the generated privacy_policy.html (e.g. GitHub Pages, Netlify).
-PRIVACY_POLICY_URL = os.getenv("PRIVACY_POLICY_URL", "https://sirchidiya.github.io/authkeys-bot/privacy-policy.html")
+PRIVACY_POLICY_URL = os.getenv(
+    "PRIVACY_POLICY_URL",
+    "https://sirchidiya-svg.github.io/telegram-authkeys-bot/privacy-policy.html"
+)
 
 
 def generate_numeric_key(length=8):
