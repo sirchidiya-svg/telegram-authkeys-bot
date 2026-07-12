@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Privacy Policy — AuthKeys Bot</title>
+<style>
+  :root {
+    --ink: #1c1c1e;
+    --muted: #5b5b60;
+    --line: #e4e2dd;
+    --bg: #fbfaf8;
+    --accent: #2f5d50;
+    --card: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+  }
+  .wrap {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 56px 24px 96px;
+  }
+  header {
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 28px;
+    margin-bottom: 40px;
+  }
+  .eyebrow {
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+  h1 {
+    font-size: 32px;
+    margin: 0 0 8px;
+    letter-spacing: -0.01em;
+  }
+  .meta {
+    color: var(--muted);
+    font-size: 14px;
+  }
+  h2 {
+    font-size: 19px;
+    margin: 40px 0 12px;
+    color: var(--ink);
+  }
+  p, li {
+    color: #2c2c2e;
+    font-size: 15.5px;
+  }
+  ul {
+    padding-left: 20px;
+  }
+  li {
+    margin-bottom: 6px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin: 18px 0;
+    font-size: 14.5px;
+    color: var(--muted);
+  }
+  a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-color: rgba(47,93,80,0.35);
+  }
+  code {
+    background: #f0eee9;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 13.5px;
+  }
+  footer {
+    margin-top: 56px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 13.5px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">AuthKeys Bot</div>
+    <h1>Privacy Policy</h1>
+    <div class="meta">Effective date: July 12, 2026 &nbsp;·&nbsp; Last updated: July 12, 2026</div>
+  </header>
+
+  <p>This policy explains what data AuthKeys Bot ("the Bot", "we", "us") collects when you use it on Telegram, why we collect it, and the rights you have over it. It's written to meet the requirements Telegram sets for bots on its platform and the EU General Data Protection Regulation (GDPR).</p>
+
+  <div class="card">
+    <strong>Data controller:</strong> Chidiebube, operating as <a href="https://t.me/sirchidiya">@sirchidiya</a> on Telegram. For any privacy request, contact us directly via Telegram DM at the link above.
+  </div>
+
+  <h2>1. What data we collect</h2>
+  <ul>
+    <li><strong>Telegram identifiers</strong> — your numeric Telegram user ID and chat ID, used to associate your saved data and usage with your account. We do not need or request your phone number.</li>
+    <li><strong>Saved key data</strong> — any title, details, and generated key you choose to save with <code>/save</code>. This is encrypted at rest using symmetric (Fernet) encryption before it touches disk.</li>
+    <li><strong>Usage data</strong> — your free-trial start date and a daily count of bot actions, used solely to enforce the free-tier daily limit.</li>
+    <li><strong>Subscription data</strong> — whether you have an active subscription and its expiry date.</li>
+    <li><strong>Payment confirmation data</strong> — if you subscribe via Telegram Stars, we receive a payment confirmation (transaction reference, amount in Stars, timestamp) from Telegram. We never see or store card numbers, bank details, or other payment credentials — Telegram itself processes the payment.</li>
+  </ul>
+
+  <h2>2. Why we process this data (legal basis)</h2>
+  <ul>
+    <li><strong>Performance of a contract</strong> (GDPR Art. 6(1)(b)) — to provide the key-generation, storage, and subscription features you request.</li>
+    <li><strong>Legitimate interest</strong> (Art. 6(1)(f)) — to prevent abuse, e.g. rate-limiting and daily usage caps.</li>
+    <li><strong>Consent</strong> (Art. 6(1)(a)) — for optional features like saving data with <code>/save</code>, which you actively choose to use.</li>
+  </ul>
+
+  <h2>3. How long we keep your data</h2>
+  <p>Saved key entries are kept until you delete them yourself with <code>/delete</code> or <code>/delete_all_my_data</code>, or until you request deletion via <a href="https://t.me/sirchidiya">@sirchidiya</a>. Daily usage counters are only used for the current day's limit and are not retained for profiling. Subscription and payment confirmation records are kept as long as reasonably required for accounting and dispute resolution.</p>
+
+  <h2>4. Your rights</h2>
+  <p>Under GDPR, and regardless of where you live, you have the right to:</p>
+  <ul>
+    <li><strong>Access</strong> your data — run <code>/export_my_data</code> at any time to receive everything we've stored for you.</li>
+    <li><strong>Erase</strong> your data — run <code>/delete</code> for a single entry or <code>/delete_all_my_data</code> to wipe everything.</li>
+    <li><strong>Rectify</strong> inaccurate data — delete and re-save an entry, or contact us directly.</li>
+    <li><strong>Restrict or object</strong> to processing — contact us and we will act on your request.</li>
+    <li><strong>Data portability</strong> — the export from <code>/export_my_data</code> is provided in a readable, portable format.</li>
+    <li><strong>Lodge a complaint</strong> with your local data protection supervisory authority, if you believe your data has been mishandled.</li>
+  </ul>
+
+  <h2>5. Data sharing</h2>
+  <p>We do not sell, rent, or share your data with advertisers or third parties. The only external party involved is Telegram itself, which processes all messages and, where applicable, Telegram Stars payments, under <a href="https://telegram.org/privacy" target="_blank" rel="noopener">Telegram's own Privacy Policy</a>.</p>
+
+  <h2>6. Security</h2>
+  <p>Saved key details and generated keys are encrypted at rest. Access to the underlying database is restricted to the bot operator. No system is perfectly secure, so please avoid saving anything you wouldn't be comfortable storing digitally in general.</p>
+
+  <h2>7. Children's privacy</h2>
+  <p>This Bot is not directed at children and is not knowingly used to collect data from anyone under the minimum age required to use Telegram in their country (13, or higher where local law requires — e.g. 16 in parts of the EU). If you believe a child has provided us data, contact us and we will remove it.</p>
+
+  <h2>8. Changes to this policy</h2>
+  <p>If this policy changes materially, we'll update the "Last updated" date above. Continued use of the Bot after changes means you accept the revised policy.</p>
+
+  <h2>9. Contact</h2>
+  <p>For any question, correction, deletion request, or complaint about your data, message <a href="https://t.me/sirchidiya">@sirchidiya</a> directly on Telegram.</p>
+
+  <footer>
+    AuthKeys Bot Privacy Policy — compliant with Telegram Bot Platform requirements and EU GDPR.
+  </footer>
+
+</div>
+</body>
+</html>
