@@ -385,6 +385,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Example usage:*\n"
         "/numeric \\- Gets a key like: `47392615`\n"
         "/alphanumeric \\- Gets a key like: `K9M2L7X4`\n\n"
+        "🆓 Free users get 10 uses/day for your first 7 days.\n"
+        "💫 Subscribers get unlimited use for 30 days.\n\n"
         f"_Created by [@{TELEGRAM_CONTACT_USERNAME}]({TELEGRAM_CONTACT_URL})_"
     )
     keyboard = [
