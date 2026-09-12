@@ -72,12 +72,15 @@ def rate_limit(func):
     return wrapper
 
 
-# --- Usage plan setup (free trial + subscription) ---
-FREE_DAILY_LIMIT = 10       # free users get this many uses per day
+# --- Credit plan setup (free trial + subscription) ---
+# Credits are only spent by /numeric, /alphanumeric, and the "Regenerate" button — these are
+# the only actions that mint a new key. /save, /find, /delete, /delete_all_my_data, and
+# /export_my_data are free to use as often as needed; they don't consume credits.
+FREE_DAILY_CREDITS = 10     # free users get this many credits per day
 TRIAL_PERIOD_DAYS = 7       # free tier lasts this many days from first use
-SUBSCRIPTION_DAYS = 30      # a paid subscription grants unlimited use for this many days
+SUBSCRIPTION_DAYS = 30      # a paid subscription grants unlimited credits for this many days
 SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "100"))  # price in Telegram Stars
-GUEST_DAILY_LIMIT = 5  # separate, flat daily cap for @mention guest replies in chats the bot isn't a member of
+GUEST_DAILY_CREDITS = 5  # separate, flat daily cap for @mention guest replies in chats the bot isn't a member of
 
 # --- Contact / policy links ---
 TELEGRAM_CONTACT_USERNAME = "sirchidiya"
@@ -269,12 +272,12 @@ def increment_guest_usage(user_id: int) -> None:
         )
 
 
-def check_guest_usage_allowed(user_id: int) -> tuple[bool, str]:
-    """Flat 5/day cap for guest @mention replies — independent of trial/subscription status."""
+def check_guest_credit_allowed(user_id: int) -> tuple[bool, str]:
+    """Flat 5/day credit cap for guest @mention replies — independent of trial/subscription status."""
     used_today = get_guest_usage_count(user_id)
-    if used_today >= GUEST_DAILY_LIMIT:
+    if used_today >= GUEST_DAILY_CREDITS:
         return False, (
-            f"🚫 You've reached today's guest-mention limit of {GUEST_DAILY_LIMIT}. "
+            f"🚫 You've used today's {GUEST_DAILY_CREDITS} guest credits. "
             "DM the bot directly or add it to your group for full access."
         )
     increment_guest_usage(user_id)
@@ -374,19 +377,43 @@ def delete_all_records(user_id: int) -> int:
         return cursor.rowcount
 
 
-def find_all_records(user_id: int):
+def find_all_records(user_id: int, chat_id: int):
+    """Export the requesting user's own entries, scoped to THIS chat only.
+    Never spans chats — a DM export must not be able to pull in group-saved entries
+    or vice versa, and a group export must not pull in the user's other groups/DMs."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
-            "SELECT title, details, generated_key, created_at FROM saved_keys WHERE user_id = ? ORDER BY created_at",
-            (user_id,),
+            "SELECT title, details, generated_key, created_at, saved_by_name FROM saved_keys "
+            "WHERE user_id = ? AND chat_id = ? ORDER BY created_at",
+            (user_id, chat_id),
         )
         rows = cursor.fetchall()
 
     decrypted_rows = []
-    for title, details, generated_key, created_at in rows:
+    for title, details, generated_key, created_at, saved_by_name in rows:
         decrypted_details = decrypt_value(details)
         decrypted_key = decrypt_value(generated_key) if generated_key else None
-        decrypted_rows.append((title, decrypted_details, decrypted_key, created_at))
+        decrypted_rows.append((title, decrypted_details, decrypted_key, created_at, saved_by_name))
+    return decrypted_rows
+
+
+def find_all_team_records(chat_id: int):
+    """Export every teammate's entries saved in THIS group — only used when team sharing
+    is ON for the group. Still scoped to a single chat_id, so other groups and DMs
+    (the caller's own or anyone else's) are never included."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT title, details, generated_key, created_at, saved_by_name FROM saved_keys "
+            "WHERE chat_id = ? ORDER BY created_at",
+            (chat_id,),
+        )
+        rows = cursor.fetchall()
+
+    decrypted_rows = []
+    for title, details, generated_key, created_at, saved_by_name in rows:
+        decrypted_details = decrypt_value(details)
+        decrypted_key = decrypt_value(generated_key) if generated_key else None
+        decrypted_rows.append((title, decrypted_details, decrypted_key, created_at, saved_by_name))
     return decrypted_rows
 
 
@@ -451,7 +478,9 @@ def grant_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS) -> str:
     return new_expiry_str
 
 
-def get_today_usage_count(user_id: int) -> int:
+def get_today_credit_usage(user_id: int) -> int:
+    """Reads from usage_log — table name kept as-is to avoid a migration; it now tracks
+    credit spend specifically (only /numeric, /alphanumeric, and Regenerate write to it)."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
@@ -462,7 +491,7 @@ def get_today_usage_count(user_id: int) -> int:
         return row[0] if row else 0
 
 
-def increment_usage(user_id: int) -> None:
+def increment_credit_usage(user_id: int) -> None:
     today = datetime.utcnow().strftime("%Y-%m-%d")
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -474,18 +503,19 @@ def increment_usage(user_id: int) -> None:
         )
 
 
-def check_usage_allowed(user_id: int) -> tuple[bool, str]:
-    """Core plan-enforcement check.
+def check_credit_allowed(user_id: int) -> tuple[bool, str]:
+    """Core credit-enforcement check. Only called for actions that mint a new key:
+    /numeric, /alphanumeric, and the "Regenerate" button.
 
-    - Active subscribers: unlimited use (for SUBSCRIPTION_DAYS from activation/extension).
-    - Free users: FREE_DAILY_LIMIT uses/day, only during the first TRIAL_PERIOD_DAYS days
+    - Active subscribers: unlimited credits (for SUBSCRIPTION_DAYS from activation/extension).
+    - Free users: FREE_DAILY_CREDITS/day, only during the first TRIAL_PERIOD_DAYS days
       since their first-ever use. After that, they must subscribe.
     Returns (allowed, message_if_blocked).
     """
     user_row = get_or_create_user(user_id)
 
     if is_subscribed(user_row):
-        increment_usage(user_id)  # tracked for stats only, doesn't block
+        increment_credit_usage(user_id)  # tracked for stats only, doesn't block
         return True, ""
 
     trial_start = datetime.strptime(user_row["trial_start"], "%Y-%m-%d")
@@ -494,26 +524,30 @@ def check_usage_allowed(user_id: int) -> tuple[bool, str]:
     if days_elapsed >= TRIAL_PERIOD_DAYS:
         return False, (
             "🚫 Your 7-day free trial has ended.\n"
-            "Subscribe to unlock 30 days of unlimited use — see /subscribe."
+            "Subscribe to unlock 30 days of unlimited credits — see /subscribe."
         )
 
-    today_count = get_today_usage_count(user_id)
-    if today_count >= FREE_DAILY_LIMIT:
+    today_count = get_today_credit_usage(user_id)
+    if today_count >= FREE_DAILY_CREDITS:
         return False, (
-            f"🚫 You've hit today's free limit of {FREE_DAILY_LIMIT} uses.\n"
-            f"Come back tomorrow, or subscribe for unlimited access — see /subscribe."
+            f"🚫 You've used today's {FREE_DAILY_CREDITS} free credits.\n"
+            f"Come back tomorrow, or subscribe for unlimited credits — see /subscribe."
         )
 
-    increment_usage(user_id)
+    increment_credit_usage(user_id)
     return True, ""
 
 
-def usage_limit(func):
-    """Decorator that enforces the free-trial / subscription usage plan before running a command."""
+def credit_limit(func):
+    """Decorator that spends a credit before running a command. Only apply this to
+    /numeric and /alphanumeric — the "Regenerate" button checks credits directly in
+    handle_callback since it's a button press, not a command. No other command
+    (/save, /find, /delete, /delete_all_my_data, /export_my_data) should carry this —
+    they don't mint new keys, so they stay free to use."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        allowed, reason = check_usage_allowed(user_id)
+        allowed, reason = check_credit_allowed(user_id)
         if not allowed:
             await update.message.reply_text(reason)
             return
@@ -532,8 +566,10 @@ def build_welcome_message() -> str:
         "*Example usage:*\n"
         "/numeric \\- Gets a key like: `47392615`\n"
         "/alphanumeric \\- Gets a key like: `K9M2L7X4`\n\n"
-        "🆓 Free users get 10 uses/day for your first 7 days\\.\n"
-        "💫 Subscribers get unlimited use for 30 days\\.\n\n"
+        "🆓 Free users get 10 credits/day for your first 7 days\\.\n"
+        "💫 Subscribers get unlimited credits for 30 days\\.\n"
+        "Credits are only spent by /numeric, /alphanumeric, and Regenerate — "
+        "saving, finding, deleting, and exporting are always free\\.\n\n"
         f"_Created by [@{TELEGRAM_CONTACT_USERNAME}]({TELEGRAM_CONTACT_URL})_"
     )
 
@@ -557,7 +593,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @rate_limit
-@usage_limit
+@credit_limit
 async def generate_numeric(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Generate and send a numeric key with regenerate button"""
     key = generate_numeric_key()
@@ -574,7 +610,7 @@ async def generate_numeric(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 @rate_limit
-@usage_limit
+@credit_limit
 async def generate_alphanumeric(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -604,9 +640,10 @@ def full_commands_text() -> str:
         "/find {title} - Retrieve a saved key by title\n"
         "/delete {title} - Delete a saved entry by title\n"
         "/delete_all_my_data - Delete ALL your saved entries\n"
-        "/export_my_data - Export all your saved data\n"
-        "/status - Check your trial/subscription status and remaining uses\n"
-        "/subscribe - Get unlimited use for 30 days\n"
+        "/export_my_data - Export saved data for THIS chat only (your own in DMs; the whole "
+        "team's if sharing is on in a group)\n"
+        "/status - Check your trial/subscription status and remaining credits\n"
+        "/subscribe - Get unlimited credits for 30 days\n"
         "/team_sharing on|off - Toggle team key sharing for this group (group chats only)\n"
         "/help - Contact support, collaboration or sponsorship\n\n"
         "Example usage:\n"
@@ -615,9 +652,12 @@ def full_commands_text() -> str:
         "[Reply to a generated key message] /save api1 my-api-key - attaches the generated key to your saved note.\n"
         "/find api1 - Retrieve the saved key for title 'api1'.\n"
         "/delete api1 - Delete the saved entry for title 'api1'.\n\n"
-        "🆓 Free users get 10 uses/day for your first 7 days.\n"
-        "💫 Subscribers get unlimited use for 30 days.\n\n"
-        "🔒 Your data is encrypted at rest and only accessible via your own Telegram account."
+        "🆓 Free users get 10 credits/day for your first 7 days.\n"
+        "💫 Subscribers get unlimited credits for 30 days.\n"
+        "Only /numeric, /alphanumeric, and Regenerate spend credits — everything else is free.\n\n"
+        "🔒 Your data is encrypted at rest and only accessible via your own Telegram account. "
+        "DM-saved entries never appear in group exports or group /find, and vice versa — "
+        "each chat is its own partition."
     )
 
 
@@ -635,7 +675,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @rate_limit
-@usage_limit
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
     parts = text.split(" ", 2)
@@ -697,7 +736,6 @@ def build_find_response(
 
 
 @rate_limit
-@usage_limit
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
@@ -733,7 +771,6 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @rate_limit
-@usage_limit
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
@@ -752,7 +789,6 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 @rate_limit
-@usage_limit
 async def delete_all_my_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
         [
@@ -768,20 +804,36 @@ async def delete_all_my_data_command(update: Update, context: ContextTypes.DEFAU
 
 
 @rate_limit
-@usage_limit
 async def export_my_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Export saved entries. Scoped to the chat the command is run in — a DM export never
+    includes group-saved entries and a group export never includes DM or other-group entries.
+    In a group with team sharing ON, exports every teammate's entries saved in that group
+    (with who saved each one); otherwise exports only the caller's own entries for this chat.
+    Free to use — export doesn't spend credits."""
     user_id = update.effective_user.id
-    records = find_all_records(user_id)
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    team_mode = chat_type in ("group", "supergroup") and is_sharing_enabled(chat_id)
+
+    if team_mode:
+        records = find_all_team_records(chat_id)
+        scope_label = "this group's shared"
+        header = "📦 This group's shared saved data:\n"
+    else:
+        records = find_all_records(user_id, chat_id)
+        scope_label = "your"
+        header = "📦 Your saved data for this chat:\n"
 
     if not records:
-        await update.message.reply_text("You have no saved data to export.")
+        await update.message.reply_text(f"There's no {scope_label} saved data to export here.")
         return
 
-    lines = ["📦 Your saved data:\n"]
-    for title, details, generated_key, created_at in records:
+    lines = [header]
+    for title, details, generated_key, created_at, saved_by_name in records:
         key_text = generated_key if generated_key else "N/A"
+        saved_by_line = f"Saved by: {saved_by_name}\n" if team_mode else ""
         lines.append(
-            f"Title: {title}\nDetails: {details}\nGenerated key: {key_text}\nSaved: {created_at}\n"
+            f"Title: {title}\n{saved_by_line}Details: {details}\nGenerated key: {key_text}\nSaved: {created_at}\n"
         )
 
     export_text = "\n".join(lines)
@@ -837,13 +889,13 @@ async def team_sharing_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 @rate_limit
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the user their current trial/subscription status and remaining daily uses."""
+    """Show the user their current trial/subscription status and remaining daily credits."""
     user_id = update.effective_user.id
     user_row = get_or_create_user(user_id)
 
     if is_subscribed(user_row):
         await update.message.reply_text(
-            f"✅ Active subscription — unlimited use until {user_row['subscription_expires']} UTC."
+            f"✅ Active subscription — unlimited credits until {user_row['subscription_expires']} UTC."
         )
         return
 
@@ -853,17 +905,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if days_left == 0:
         await update.message.reply_text(
-            "🚫 Your free trial has ended.\nSubscribe with /subscribe for 30 days of unlimited use."
+            "🚫 Your free trial has ended.\nSubscribe with /subscribe for 30 days of unlimited credits."
         )
         return
 
-    used_today = get_today_usage_count(user_id)
-    remaining_today = max(0, FREE_DAILY_LIMIT - used_today)
+    used_today = get_today_credit_usage(user_id)
+    remaining_today = max(0, FREE_DAILY_CREDITS - used_today)
     await update.message.reply_text(
         f"🆓 Free trial: {days_left} day(s) left.\n"
-        f"Today's usage: {used_today}/{FREE_DAILY_LIMIT}\n"
-        f"Remaining today: {remaining_today}\n\n"
-        f"Subscribe with /subscribe for 30 days of unlimited use."
+        f"Credits used today: {used_today}/{FREE_DAILY_CREDITS}\n"
+        f"Credits remaining today: {remaining_today}\n\n"
+        f"Only /numeric, /alphanumeric, and Regenerate spend credits.\n"
+        f"Subscribe with /subscribe for 30 days of unlimited credits."
     )
 
 
@@ -874,7 +927,7 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await context.bot.send_invoice(
         chat_id=chat_id,
         title="AuthKeys Bot — 30 Day Subscription",
-        description=f"Unlimited use of AuthKeys Bot for {SUBSCRIPTION_DAYS} days.",
+        description=f"Unlimited credits on AuthKeys Bot for {SUBSCRIPTION_DAYS} days.",
         payload=f"subscription_{update.effective_user.id}",
         provider_token="",  # empty string is required for Telegram Stars payments
         currency="XTR",
@@ -896,7 +949,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     user_id = update.effective_user.id
     new_expiry = grant_subscription(user_id, days=SUBSCRIPTION_DAYS)
     await update.message.reply_text(
-        f"✅ Payment received! You now have unlimited use until {new_expiry} UTC."
+        f"✅ Payment received! You now have unlimited credits until {new_expiry} UTC."
     )
 
 
@@ -917,15 +970,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = query.from_user.id
 
     # The "Regenerate" button generates a new key just like /numeric or /alphanumeric,
-    # so it must be rate-limited and counted against the free daily usage limit too —
-    # otherwise a free user could tap Regenerate unlimited times to bypass the cap.
+    # so it spends a credit too — otherwise a free user could tap Regenerate unlimited
+    # times to bypass the daily credit cap.
     if query.data in ("regenerate_numeric", "regenerate_alphanumeric"):
         wait = _rate_limit_wait_seconds(user_id)
         if wait is not None:
             await query.answer(f"⏳ Please wait {wait}s before trying again.", show_alert=True)
             return
 
-        allowed, reason = check_usage_allowed(user_id)
+        allowed, reason = check_credit_allowed(user_id)
         if not allowed:
             await query.answer(reason, show_alert=True)
             return
@@ -1010,11 +1063,11 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
         # Per design: only reply when a key type is explicitly requested in the mention.
         return
 
-    allowed, reason = check_guest_usage_allowed(user_id)
+    allowed, reason = check_guest_credit_allowed(user_id)
     if not allowed:
         result = InlineQueryResultArticle(
             id=str(uuid.uuid4()),
-            title="Daily guest limit reached",
+            title="Daily guest credits reached",
             input_message_content=InputTextMessageContent(reason),
         )
         await context.bot.answer_guest_query(guest_query_id=guest_msg.guest_query_id, result=result)
