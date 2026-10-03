@@ -1,16 +1,20 @@
 import os
 import random
-import sqlite3
 import string
 import time
 import uuid
+import sys
+import html
+import asyncio
 from datetime import datetime, timedelta
 from functools import wraps
-import asyncio
-import html
-import sys
+from contextlib import contextmanager
+
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet, InvalidToken
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+
 from telegram import (
     Update,
     InlineKeyboardMarkup,
@@ -36,10 +40,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook")
 PORT = int(os.getenv("PORT", "8443"))
-# Where the SQLite file lives. On Railway, attach a Volume (e.g. mounted at /data) and set
-# DB_PATH=/data/authkeys.db so saved keys and subscriptions survive redeploys.
-DB_PATH = os.getenv("DB_PATH") or os.path.join(os.path.dirname(__file__), "authkeys.db")
-os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # --- Encryption setup ---
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
@@ -47,19 +48,36 @@ if not ENCRYPTION_KEY:
     raise ValueError("ENCRYPTION_KEY not found in environment variables!")
 FERNET = Fernet(ENCRYPTION_KEY.encode())
 
-
 def encrypt_value(value: str) -> str:
     return FERNET.encrypt(value.encode()).decode()
-
 
 def decrypt_value(value: str) -> str:
     return FERNET.decrypt(value.encode()).decode()
 
+# --- Database Pool Setup ---
+DB_POOL = None
+
+def init_connection_pool():
+    global DB_POOL
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL not found in environment variables!")
+    # Use ThreadedConnectionPool for thread-safe concurrent database access
+    DB_POOL = ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
+
+@contextmanager
+def get_db_connection():
+    """Yields a connection from the pool and ensures it is returned."""
+    conn = DB_POOL.getconn()
+    try:
+        # 'with conn' ensures transactions are committed on success, or rolled back on error
+        with conn:
+            yield conn
+    finally:
+        DB_POOL.putconn(conn)
 
 # --- Rate limiting setup ---
 RATE_LIMIT_SECONDS = 3
 _last_command_time: dict[int, float] = {}
-
 
 def rate_limit(func):
     @wraps(func)
@@ -75,33 +93,22 @@ def rate_limit(func):
         return await func(update, context)
     return wrapper
 
-
-# --- Credit plan setup (free trial + subscription) ---
-# Credits are only spent by /numeric, /alphanumeric, and the "Regenerate" button — these are
-# the only actions that mint a new key. /save, /find, /delete, /delete_all_my_data, and
-# /export_my_data are free to use as often as needed; they don't consume credits.
-FREE_DAILY_CREDITS = 10     # free users get this many credits per day
-TRIAL_PERIOD_DAYS = 7       # free tier lasts this many days from first use
-SUBSCRIPTION_DAYS = 30      # a paid subscription grants unlimited credits for this many days
-SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "100"))  # price in Telegram Stars
-GUEST_DAILY_CREDITS = 5  # separate, flat daily cap for @mention guest replies in chats the bot isn't a member of
+# --- Credit plan setup ---
+FREE_DAILY_CREDITS = 10     
+TRIAL_PERIOD_DAYS = 7       
+SUBSCRIPTION_DAYS = 30      
+SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "100"))  
+GUEST_DAILY_CREDITS = 5  
 
 # --- Contact / policy links ---
 TELEGRAM_CONTACT_USERNAME = "sirchidiya"
 TELEGRAM_CONTACT_URL = f"https://t.me/{TELEGRAM_CONTACT_USERNAME}"
-# Set this to wherever you host the generated privacy_policy.html (e.g. GitHub Pages, Netlify).
 PRIVACY_POLICY_URL = os.getenv("PRIVACY_POLICY_URL", "https://sirchidiya-svg.github.io/telegram-authkeys-bot/privacy-policy.html")
 
-
 def generate_numeric_key(length=8):
-    """Generate a numeric key of specified length"""
     return "".join(random.choices(string.digits, k=length))
 
-
 def generate_alphanumeric_key(length=8):
-    """Generate an alphanumeric key of specified length.
-    Guarantees at least one letter AND one digit — plain random.choices() over the
-    full 36-char pool could (and sometimes did) produce all-letter keys by chance."""
     if length < 2:
         characters = string.ascii_uppercase + string.digits
         return "".join(random.choices(characters, k=length))
@@ -113,50 +120,16 @@ def generate_alphanumeric_key(length=8):
     random.shuffle(key_chars)
     return "".join(key_chars)
 
-
 def init_db() -> None:
-    """Initialize the SQLite database and saved_keys table."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS saved_keys (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                chat_id INTEGER,
-                saved_by_name TEXT,
-                title TEXT NOT NULL,
-                details TEXT NOT NULL,
-                generated_key TEXT,
-                created_at TEXT NOT NULL,
-                UNIQUE(user_id, chat_id, title)
-            )
-            """
-        )
-        cursor = conn.execute("PRAGMA table_info(saved_keys)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "generated_key" not in columns:
-            conn.execute("ALTER TABLE saved_keys ADD COLUMN generated_key TEXT")
-        if "chat_id" not in columns:
-            conn.execute("ALTER TABLE saved_keys ADD COLUMN chat_id INTEGER")
-        if "saved_by_name" not in columns:
-            conn.execute("ALTER TABLE saved_keys ADD COLUMN saved_by_name TEXT")
-
-        # If the table still has the old UNIQUE(user_id, title) constraint (pre-team-sharing
-        # deployments), rebuild it with the new constraint. Existing rows are preserved;
-        # their chat_id/saved_by_name will be NULL since that context wasn't tracked before.
-        cursor = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='saved_keys'"
-        )
-        row = cursor.fetchone()
-        existing_sql = row[0] if row else ""
-        if existing_sql and "UNIQUE(user_id, chat_id, title)" not in existing_sql:
-            conn.execute("ALTER TABLE saved_keys RENAME TO saved_keys_old")
-            conn.execute(
+    """Initialize the PostgreSQL database tables."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
                 """
-                CREATE TABLE saved_keys (
-                    id INTEGER PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
-                    chat_id INTEGER,
+                CREATE TABLE IF NOT EXISTS saved_keys (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT,
                     saved_by_name TEXT,
                     title TEXT NOT NULL,
                     details TEXT NOT NULL,
@@ -166,118 +139,101 @@ def init_db() -> None:
                 )
                 """
             )
-            conn.execute(
+            cursor.execute(
                 """
-                INSERT INTO saved_keys (id, user_id, chat_id, saved_by_name, title, details, generated_key, created_at)
-                SELECT id, user_id, chat_id, saved_by_name, title, details, generated_key, created_at FROM saved_keys_old
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    trial_start TEXT NOT NULL,
+                    subscription_expires TEXT
+                )
                 """
             )
-            conn.execute("DROP TABLE saved_keys_old")
-
-        # --- Usage plan tables ---
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                trial_start TEXT NOT NULL,
-                subscription_expires TEXT
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS usage_log (
+                    user_id BIGINT NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, usage_date)
+                )
+                """
             )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS usage_log (
-                user_id INTEGER NOT NULL,
-                usage_date TEXT NOT NULL,
-                count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, usage_date)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS generated_keys (
+                    chat_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    key_value TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, message_id)
+                )
+                """
             )
-            """
-        )
-
-        # --- Generated-key tags (so /save can verify a replied-to message is a real bot-generated key) ---
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS generated_keys (
-                chat_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                key_value TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (chat_id, message_id)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS group_settings (
+                    chat_id BIGINT PRIMARY KEY,
+                    sharing_enabled INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-
-        # --- Per-group team sharing toggle ---
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS group_settings (
-                chat_id INTEGER PRIMARY KEY,
-                sharing_enabled INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guest_usage_log (
+                    user_id BIGINT NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, usage_date)
+                )
+                """
             )
-            """
-        )
-
-        # --- Guest-mode (@mention in chats the bot isn't in) usage cap — separate from the main plan ---
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS guest_usage_log (
-                user_id INTEGER NOT NULL,
-                usage_date TEXT NOT NULL,
-                count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, usage_date)
-            )
-            """
-        )
-
 
 def is_sharing_enabled(chat_id: int) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "SELECT sharing_enabled FROM group_settings WHERE chat_id = ?", (chat_id,)
-        )
-        row = cursor.fetchone()
-        return bool(row[0]) if row else False
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT sharing_enabled FROM group_settings WHERE chat_id = %s", (chat_id,)
+            )
+            row = cursor.fetchone()
+            return bool(row[0]) if row else False
 
 def set_sharing_enabled(chat_id: int, enabled: bool) -> None:
     updated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO group_settings (chat_id, sharing_enabled, updated_at) VALUES (?, ?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET sharing_enabled = excluded.sharing_enabled, updated_at = excluded.updated_at
-            """,
-            (chat_id, 1 if enabled else 0, updated_at),
-        )
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO group_settings (chat_id, sharing_enabled, updated_at) VALUES (%s, %s, %s)
+                ON CONFLICT(chat_id) DO UPDATE SET sharing_enabled = EXCLUDED.sharing_enabled, updated_at = EXCLUDED.updated_at
+                """,
+                (chat_id, 1 if enabled else 0, updated_at),
+            )
 
 def get_guest_usage_count(user_id: int) -> int:
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "SELECT count FROM guest_usage_log WHERE user_id = ? AND usage_date = ?",
-            (user_id, today),
-        )
-        row = cursor.fetchone()
-        return row[0] if row else 0
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT count FROM guest_usage_log WHERE user_id = %s AND usage_date = %s",
+                (user_id, today),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else 0
 
 def increment_guest_usage(user_id: int) -> None:
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO guest_usage_log (user_id, usage_date, count) VALUES (?, ?, 1)
-            ON CONFLICT(user_id, usage_date) DO UPDATE SET count = count + 1
-            """,
-            (user_id, today),
-        )
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO guest_usage_log (user_id, usage_date, count) VALUES (%s, %s, 1)
+                ON CONFLICT(user_id, usage_date) DO UPDATE SET count = guest_usage_log.count + 1
+                """,
+                (user_id, today),
+            )
 
 def check_guest_credit_allowed(user_id: int) -> tuple[bool, str]:
-    """Flat 5/day credit cap for guest @mention replies — independent of trial/subscription status."""
     used_today = get_guest_usage_count(user_id)
     if used_today >= GUEST_DAILY_CREDITS:
         return False, (
@@ -286,7 +242,6 @@ def check_guest_credit_allowed(user_id: int) -> tuple[bool, str]:
         )
     increment_guest_usage(user_id)
     return True, ""
-
 
 def save_record(
     user_id: int,
@@ -299,99 +254,95 @@ def save_record(
     created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     encrypted_details = encrypt_value(details)
     encrypted_key = encrypt_value(generated_key) if generated_key else None
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO saved_keys
-                (user_id, chat_id, saved_by_name, title, details, generated_key, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, chat_id, saved_by_name, title, encrypted_details, encrypted_key, created_at),
-        )
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO saved_keys
+                    (user_id, chat_id, saved_by_name, title, details, generated_key, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, chat_id, title) DO UPDATE SET
+                    saved_by_name = EXCLUDED.saved_by_name,
+                    details = EXCLUDED.details,
+                    generated_key = EXCLUDED.generated_key,
+                    created_at = EXCLUDED.created_at
+                """,
+                (user_id, chat_id, saved_by_name, title, encrypted_details, encrypted_key, created_at),
+            )
     return created_at
 
-
 def tag_generated_key(chat_id: int, message_id: int, key_value: str) -> None:
-    """Record that a specific message in a specific chat contains a bot-generated key.
-    Called right after sending/regenerating a key so /save can later verify a reply is legit."""
     created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     encrypted_key = encrypt_value(key_value)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO generated_keys (chat_id, message_id, key_value, created_at) VALUES (?, ?, ?, ?)",
-            (chat_id, message_id, encrypted_key, created_at),
-        )
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO generated_keys (chat_id, message_id, key_value, created_at) VALUES (%s, %s, %s, %s)
+                ON CONFLICT(chat_id, message_id) DO UPDATE SET key_value = EXCLUDED.key_value, created_at = EXCLUDED.created_at
+                """,
+                (chat_id, message_id, encrypted_key, created_at),
+            )
 
 def get_tagged_key(chat_id: int, message_id: int) -> str | None:
-    """Look up the bot-generated key attached to a specific message, if any."""
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "SELECT key_value FROM generated_keys WHERE chat_id = ? AND message_id = ?",
-            (chat_id, message_id),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return None
-        return decrypt_value(row[0])
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT key_value FROM generated_keys WHERE chat_id = %s AND message_id = %s",
+                (chat_id, message_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return decrypt_value(row[0])
 
 def find_record(user_id: int, chat_id: int, title: str, team_mode: bool = False):
-    """Look up a saved entry.
-    - team_mode=False: only the requesting user's own entry, scoped to this chat.
-    - team_mode=True: any teammate's entry saved in this chat (group sharing must be on)."""
-    with sqlite3.connect(DB_PATH) as conn:
-        if team_mode:
-            cursor = conn.execute(
-                "SELECT details, generated_key, created_at, saved_by_name FROM saved_keys "
-                "WHERE chat_id = ? AND title = ?",
-                (chat_id, title),
-            )
-        else:
-            cursor = conn.execute(
-                "SELECT details, generated_key, created_at, saved_by_name FROM saved_keys "
-                "WHERE user_id = ? AND chat_id = ? AND title = ?",
-                (user_id, chat_id, title),
-            )
-        row = cursor.fetchone()
-        if not row:
-            return None
-        details, generated_key, created_at, saved_by_name = row
-        decrypted_details = decrypt_value(details)
-        decrypted_key = decrypt_value(generated_key) if generated_key else None
-        return decrypted_details, decrypted_key, created_at, saved_by_name
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if team_mode:
+                cursor.execute(
+                    "SELECT details, generated_key, created_at, saved_by_name FROM saved_keys "
+                    "WHERE chat_id = %s AND title = %s",
+                    (chat_id, title),
+                )
+            else:
+                cursor.execute(
+                    "SELECT details, generated_key, created_at, saved_by_name FROM saved_keys "
+                    "WHERE user_id = %s AND chat_id = %s AND title = %s",
+                    (user_id, chat_id, title),
+                )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            details, generated_key, created_at, saved_by_name = row
+            decrypted_details = decrypt_value(details)
+            decrypted_key = decrypt_value(generated_key) if generated_key else None
+            return decrypted_details, decrypted_key, created_at, saved_by_name
 
 def delete_record(user_id: int, chat_id: int, title: str) -> bool:
-    """Delete only entries the requesting user owns — sharing never grants delete rights over others' data."""
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "DELETE FROM saved_keys WHERE user_id = ? AND chat_id = ? AND title = ?",
-            (user_id, chat_id, title),
-        )
-        return cursor.rowcount > 0
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM saved_keys WHERE user_id = %s AND chat_id = %s AND title = %s",
+                (user_id, chat_id, title),
+            )
+            return cursor.rowcount > 0
 
 def delete_all_records(user_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "DELETE FROM saved_keys WHERE user_id = ?",
-            (user_id,),
-        )
-        return cursor.rowcount
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM saved_keys WHERE user_id = %s", (user_id,))
+            return cursor.rowcount
 
 def find_all_records(user_id: int, chat_id: int):
-    """Export the requesting user's own entries, scoped to THIS chat only.
-    Never spans chats — a DM export must not be able to pull in group-saved entries
-    or vice versa, and a group export must not pull in the user's other groups/DMs."""
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "SELECT title, details, generated_key, created_at, saved_by_name FROM saved_keys "
-            "WHERE user_id = ? AND chat_id = ? ORDER BY created_at",
-            (user_id, chat_id),
-        )
-        rows = cursor.fetchall()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT title, details, generated_key, created_at, saved_by_name FROM saved_keys "
+                "WHERE user_id = %s AND chat_id = %s ORDER BY created_at",
+                (user_id, chat_id),
+            )
+            rows = cursor.fetchall()
 
     decrypted_rows = []
     for title, details, generated_key, created_at, saved_by_name in rows:
@@ -399,19 +350,16 @@ def find_all_records(user_id: int, chat_id: int):
         decrypted_key = decrypt_value(generated_key) if generated_key else None
         decrypted_rows.append((title, decrypted_details, decrypted_key, created_at, saved_by_name))
     return decrypted_rows
-
 
 def find_all_team_records(chat_id: int):
-    """Export every teammate's entries saved in THIS group — only used when team sharing
-    is ON for the group. Still scoped to a single chat_id, so other groups and DMs
-    (the caller's own or anyone else's) are never included."""
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "SELECT title, details, generated_key, created_at, saved_by_name FROM saved_keys "
-            "WHERE chat_id = ? ORDER BY created_at",
-            (chat_id,),
-        )
-        rows = cursor.fetchall()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT title, details, generated_key, created_at, saved_by_name FROM saved_keys "
+                "WHERE chat_id = %s ORDER BY created_at",
+                (chat_id,),
+            )
+            rows = cursor.fetchall()
 
     decrypted_rows = []
     for title, details, generated_key, created_at, saved_by_name in rows:
@@ -420,30 +368,25 @@ def find_all_team_records(chat_id: int):
         decrypted_rows.append((title, decrypted_details, decrypted_key, created_at, saved_by_name))
     return decrypted_rows
 
-
-# --- Usage plan helpers ---
-
 def get_or_create_user(user_id: int) -> dict:
-    """Fetch a user's plan row, creating one (and starting their trial) on first use."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "SELECT user_id, trial_start, subscription_expires FROM users WHERE user_id = ?",
-            (user_id,),
-        )
-        row = cursor.fetchone()
-        if row:
-            return {"user_id": row[0], "trial_start": row[1], "subscription_expires": row[2]}
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT user_id, trial_start, subscription_expires FROM users WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                return {"user_id": row[0], "trial_start": row[1], "subscription_expires": row[2]}
 
-        conn.execute(
-            "INSERT INTO users (user_id, trial_start, subscription_expires) VALUES (?, ?, NULL)",
-            (user_id, today),
-        )
-        return {"user_id": user_id, "trial_start": today, "subscription_expires": None}
-
+            cursor.execute(
+                "INSERT INTO users (user_id, trial_start, subscription_expires) VALUES (%s, %s, NULL)",
+                (user_id, today),
+            )
+            return {"user_id": user_id, "trial_start": today, "subscription_expires": None}
 
 def is_subscribed(user_row: dict) -> bool:
-    """Return True if the user currently has an active (unexpired) subscription."""
     expires = user_row.get("subscription_expires")
     if not expires:
         return False
@@ -453,12 +396,7 @@ def is_subscribed(user_row: dict) -> bool:
         return False
     return datetime.utcnow() < expires_dt
 
-
 def grant_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS) -> str:
-    """Activate (or extend) a user's subscription. Returns the new expiry timestamp string.
-
-    Hook this up to your Telegram Stars payment handler once that's wired in.
-    """
     user_row = get_or_create_user(user_id)
     now = datetime.utcnow()
 
@@ -469,57 +407,46 @@ def grant_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS) -> str:
         except ValueError:
             current_expiry = None
 
-    # Extend from current expiry if still active, otherwise start fresh from now
     base = current_expiry if current_expiry and current_expiry > now else now
     new_expiry = base + timedelta(days=days)
     new_expiry_str = new_expiry.strftime("%Y-%m-%d %H:%M:%S")
 
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "UPDATE users SET subscription_expires = ? WHERE user_id = ?",
-            (new_expiry_str, user_id),
-        )
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE users SET subscription_expires = %s WHERE user_id = %s",
+                (new_expiry_str, user_id),
+            )
     return new_expiry_str
 
-
 def get_today_credit_usage(user_id: int) -> int:
-    """Reads from usage_log — table name kept as-is to avoid a migration; it now tracks
-    credit spend specifically (only /numeric, /alphanumeric, and Regenerate write to it)."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "SELECT count FROM usage_log WHERE user_id = ? AND usage_date = ?",
-            (user_id, today),
-        )
-        row = cursor.fetchone()
-        return row[0] if row else 0
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT count FROM usage_log WHERE user_id = %s AND usage_date = %s",
+                (user_id, today),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else 0
 
 def increment_credit_usage(user_id: int) -> None:
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO usage_log (user_id, usage_date, count) VALUES (?, ?, 1)
-            ON CONFLICT(user_id, usage_date) DO UPDATE SET count = count + 1
-            """,
-            (user_id, today),
-        )
-
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO usage_log (user_id, usage_date, count) VALUES (%s, %s, 1)
+                ON CONFLICT(user_id, usage_date) DO UPDATE SET count = usage_log.count + 1
+                """,
+                (user_id, today),
+            )
 
 def check_credit_allowed(user_id: int) -> tuple[bool, str]:
-    """Core credit-enforcement check. Only called for actions that mint a new key:
-    /numeric, /alphanumeric, and the "Regenerate" button.
-
-    - Active subscribers: unlimited credits (for SUBSCRIPTION_DAYS from activation/extension).
-    - Free users: FREE_DAILY_CREDITS/day, only during the first TRIAL_PERIOD_DAYS days
-      since their first-ever use. After that, they must subscribe.
-    Returns (allowed, message_if_blocked).
-    """
     user_row = get_or_create_user(user_id)
 
     if is_subscribed(user_row):
-        increment_credit_usage(user_id)  # tracked for stats only, doesn't block
+        increment_credit_usage(user_id) 
         return True, ""
 
     trial_start = datetime.strptime(user_row["trial_start"], "%Y-%m-%d")
@@ -541,13 +468,7 @@ def check_credit_allowed(user_id: int) -> tuple[bool, str]:
     increment_credit_usage(user_id)
     return True, ""
 
-
 def credit_limit(func):
-    """Decorator that spends a credit before running a command. Only apply this to
-    /numeric and /alphanumeric — the "Regenerate" button checks credits directly in
-    handle_callback since it's a button press, not a command. No other command
-    (/save, /find, /delete, /delete_all_my_data, /export_my_data) should carry this —
-    they don't mint new keys, so they stay free to use."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -557,7 +478,6 @@ def credit_limit(func):
             return
         return await func(update, context)
     return wrapper
-
 
 def build_welcome_message() -> str:
     return (
@@ -577,7 +497,6 @@ def build_welcome_message() -> str:
         f"_Created by [@{TELEGRAM_CONTACT_USERNAME}]({TELEGRAM_CONTACT_URL})_"
     )
 
-
 def build_welcome_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -588,18 +507,14 @@ def build_welcome_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued."""
     await update.message.reply_text(
         build_welcome_message(), parse_mode="MarkdownV2", reply_markup=build_welcome_keyboard()
     )
 
-
 @rate_limit
 @credit_limit
 async def generate_numeric(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate and send a numeric key with regenerate button"""
     key = generate_numeric_key()
 
     keyboard = [
@@ -612,13 +527,11 @@ async def generate_numeric(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
     tag_generated_key(sent_message.chat_id, sent_message.message_id, key)
 
-
 @rate_limit
 @credit_limit
 async def generate_alphanumeric(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Generate and send an alphanumeric key with regenerate button"""
     key = generate_alphanumeric_key()
 
     keyboard = [
@@ -633,9 +546,7 @@ async def generate_alphanumeric(
     )
     tag_generated_key(sent_message.chat_id, sent_message.message_id, key)
 
-
 def full_commands_text() -> str:
-    """Full command reference shown when the 'Commands' button on /start is tapped."""
     return (
         "Available Commands:\n"
         "/numeric - Generate a numeric 8-digit key\n"
@@ -659,14 +570,10 @@ def full_commands_text() -> str:
         "🆓 Free users get 10 credits/day for your first 7 days.\n"
         "💫 Subscribers get unlimited credits for 30 days.\n"
         "Only /numeric, /alphanumeric, and Regenerate spend credits — everything else is free.\n\n"
-        "🔒 Your data is encrypted at rest and only accessible via your own Telegram account. "
-        "DM-saved entries never appear in group exports or group /find, and vice versa — "
-        "each chat is its own partition."
+        "🔒 Your data is encrypted at rest and only accessible via your own Telegram account."
     )
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /help is issued."""
     help_message = (
         f"Contact [@{TELEGRAM_CONTACT_USERNAME}]({TELEGRAM_CONTACT_URL}) "
         "for support, collaboration or sponsorship\\."
@@ -676,7 +583,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         help_message, parse_mode="MarkdownV2", reply_markup=reply_markup
     )
-
 
 @rate_limit
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -721,14 +627,10 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Saved '{title}'.\nDetails: {details}{key_line}\nCreated: {created_at}"
     )
 
-
 def build_find_response(
     title: str, details: str, generated_key: str | None, created_at: str,
     saved_by_name: str | None = None,
 ) -> str:
-    """Build a /find response (HTML-formatted) with the generated key in a tap-to-copy <code> block.
-    All user-supplied text is HTML-escaped so characters like _ * [ ` in titles/details can never
-    break message parsing. saved_by_name is only shown for team-shared results."""
     e = html.escape
     generated_key_text = e(generated_key) if generated_key else "N/A"
     saved_by_line = f"Saved by: {e(saved_by_name)}\n" if saved_by_name else ""
@@ -739,7 +641,6 @@ def build_find_response(
         f"Generated key: <code>{generated_key_text}</code>\n"
         f"Saved: {e(created_at)}"
     )
-
 
 @rate_limit
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -781,7 +682,6 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     await update.message.reply_text(response, parse_mode="HTML")
 
-
 @rate_limit
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
@@ -799,7 +699,6 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         await update.message.reply_text(f"No saved entry found for title '{title}'.")
 
-
 @rate_limit
 async def delete_all_my_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
@@ -814,14 +713,8 @@ async def delete_all_my_data_command(update: Update, context: ContextTypes.DEFAU
         reply_markup=reply_markup,
     )
 
-
 @rate_limit
 async def export_my_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Export saved entries. Scoped to the chat the command is run in — a DM export never
-    includes group-saved entries and a group export never includes DM or other-group entries.
-    In a group with team sharing ON, exports every teammate's entries saved in that group
-    (with who saved each one); otherwise exports only the caller's own entries for this chat.
-    Free to use — export doesn't spend credits."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
@@ -855,8 +748,6 @@ async def export_my_data_command(update: Update, context: ContextTypes.DEFAULT_T
         )
 
     export_text = "\n".join(lines)
-
-    # Telegram messages cap at ~4096 characters; chunk if needed
     max_len = 3500
     if len(export_text) <= max_len:
         await update.message.reply_text(export_text)
@@ -870,10 +761,8 @@ async def export_my_data_command(update: Update, context: ContextTypes.DEFAULT_T
         if chunk:
             await update.message.reply_text(chunk)
 
-
 @rate_limit
 async def team_sharing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Toggle or check team key-sharing for the current group. Group chats only; any member may toggle it."""
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text("Team sharing only applies inside group chats, not in DMs.")
@@ -885,8 +774,7 @@ async def team_sharing_command(update: Update, context: ContextTypes.DEFAULT_TYP
         status = "ON ✅" if current else "OFF ❌"
         await update.message.reply_text(
             f"Team key sharing is currently {status} for this group.\n\n"
-            "When ON, any member can /find keys saved by teammates in this group, "
-            "and will see who saved them. /delete and /export_my_data always stay personal.\n\n"
+            "When ON, any member can /find keys saved by teammates in this group. "
             "Use /team_sharing on or /team_sharing off to change it."
         )
         return
@@ -904,10 +792,8 @@ async def team_sharing_command(update: Update, context: ContextTypes.DEFAULT_TYP
             "/find will only show your own saved keys again."
         )
 
-
 @rate_limit
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the user their current trial/subscription status and remaining daily credits."""
     user_id = update.effective_user.id
     user_row = get_or_create_user(user_id)
 
@@ -933,47 +819,37 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"🆓 Free trial: {days_left} day(s) left.\n"
         f"Credits used today: {used_today}/{FREE_DAILY_CREDITS}\n"
         f"Credits remaining today: {remaining_today}\n\n"
-        f"Only /numeric, /alphanumeric, and Regenerate spend credits.\n"
-        f"Subscribe with /subscribe for 30 days of unlimited credits."
+        f"Only /numeric, /alphanumeric, and Regenerate spend credits."
     )
-
 
 @rate_limit
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a Telegram Stars invoice for the 30-day subscription."""
     chat_id = update.effective_chat.id
     await context.bot.send_invoice(
         chat_id=chat_id,
         title="AuthKeys Bot — 30 Day Subscription",
         description=f"Unlimited credits on AuthKeys Bot for {SUBSCRIPTION_DAYS} days.",
         payload=f"subscription_{update.effective_user.id}",
-        provider_token="",  # empty string is required for Telegram Stars payments
+        provider_token="",  
         currency="XTR",
         prices=[LabeledPrice("30-day subscription", SUBSCRIPTION_PRICE_STARS)],
     )
 
-
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Confirm the pre-checkout query so Telegram can proceed with the payment."""
     query = update.pre_checkout_query
     if query.invoice_payload.startswith("subscription_"):
         await query.answer(ok=True)
     else:
         await query.answer(ok=False, error_message="Something went wrong with your order.")
 
-
 async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Grant the subscription once Telegram confirms the Stars payment succeeded."""
     user_id = update.effective_user.id
     new_expiry = grant_subscription(user_id, days=SUBSCRIPTION_DAYS)
     await update.message.reply_text(
         f"✅ Payment received! You now have unlimited credits until {new_expiry} UTC."
     )
 
-
 def _rate_limit_wait_seconds(user_id: int) -> float | None:
-    """Check + record rate limit for a user without needing update.message (used by button callbacks).
-    Returns seconds left to wait if still limited, otherwise None (and records this attempt as the new 'last time')."""
     now = time.monotonic()
     last_time = _last_command_time.get(user_id, 0)
     if now - last_time < RATE_LIMIT_SECONDS:
@@ -981,15 +857,10 @@ def _rate_limit_wait_seconds(user_id: int) -> float | None:
     _last_command_time[user_id] = now
     return None
 
-
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle callback queries from inline keyboards"""
     query = update.callback_query
     user_id = query.from_user.id
 
-    # The "Regenerate" button generates a new key just like /numeric or /alphanumeric,
-    # so it spends a credit too — otherwise a free user could tap Regenerate unlimited
-    # times to bypass the daily credit cap.
     if query.data in ("regenerate_numeric", "regenerate_alphanumeric"):
         wait = _rate_limit_wait_seconds(user_id)
         if wait is not None:
@@ -1043,7 +914,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif query.data == "show_all_commands":
         back_keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_welcome")]]
+            [[InlineKeyboardButton("⬅ Back", callback_data="back_to_welcome")]]
         )
         await query.edit_message_text(full_commands_text(), reply_markup=back_keyboard)
 
@@ -1052,20 +923,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             build_welcome_message(), parse_mode="MarkdownV2", reply_markup=build_welcome_keyboard()
         )
 
-
 async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle @mentions of the bot in chats it isn't a member of (Telegram Guest Mode, May 2026).
-    Registered as a TypeHandler on every raw Update in a separate handler group, so it doesn't
-    interfere with normal command routing — it no-ops instantly for any update that isn't a guest mention.
-
-    NOTE: answer_guest_query()'s exact result schema is thinly documented as of this writing (the
-    feature is ~2 months old). This implementation follows the Bot API changelog's statement that
-    guest query results reuse the same InputMessageContent pattern as inline query results — test
-    against your live bot before relying on it in production.
-    """
     guest_msg = getattr(update, "guest_message", None)
     if guest_msg is None:
-        return  # not a guest mention — let the normal handlers deal with this update
+        return  
 
     caller_user = getattr(guest_msg, "guest_bot_caller_user", None)
     if caller_user is None:
@@ -1078,7 +939,6 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
     elif "numeric" in text:
         key_type, key = "Numeric", generate_numeric_key()
     else:
-        # Per design: only reply when a key type is explicitly requested in the mention.
         return
 
     allowed, reason = check_guest_credit_allowed(user_id)
@@ -1098,11 +958,12 @@ async def handle_guest_message(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     await context.bot.answer_guest_query(guest_query_id=guest_msg.guest_query_id, result=result)
 
-
 def main() -> None:
-    """Start the bot."""
     if not TOKEN:
         raise ValueError("TELEGRAM_TOKEN not found in environment variables!")
+    
+    init_connection_pool()
+    init_db()
 
     try:
         if sys.platform.startswith("win"):
@@ -1132,11 +993,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-    # Separate handler group (not 0) so this runs alongside normal command routing instead of
-    # intercepting every update — it no-ops immediately unless update.guest_message is present.
     application.add_handler(TypeHandler(Update, handle_guest_message), group=1)
-
-    init_db()
 
     if WEBHOOK_URL:
         webhook_path = WEBHOOK_PATH.lstrip("/")
@@ -1144,6 +1001,7 @@ def main() -> None:
         if webhook_path:
             webhook_url = f"{webhook_url}/{webhook_path}"
 
+        print("Starting bot using webhook...")
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -1151,8 +1009,8 @@ def main() -> None:
             webhook_url=webhook_url,
         )
     else:
+        print("Starting bot using long polling mode...")
         application.run_polling()
-
 
 if __name__ == "__main__":
     main()
