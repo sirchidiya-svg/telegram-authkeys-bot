@@ -1,5 +1,4 @@
-python-dotenv==1.0.1
-requests==2.31.0
-python-telegram-bot[webhooks]>=22.8
-black==24.4.2
-cryptography==42.0.8
+python-telegram-bot[webhooks]>=20.8
+cryptography>=42.0.0
+python-dotenv>=1.0.0
+psycopg2-binary>=2.9.9
