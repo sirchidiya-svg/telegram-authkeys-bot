@@ -1,17 +1,16 @@
 import os
-import html
-import secrets
+import random
+import sqlite3
 import string
 import time
 import uuid
-import logging
 from datetime import datetime, timedelta
 from functools import wraps
 import asyncio
+import html
 import sys
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet, InvalidToken
-from psycopg2 import pool as pg_pool
 from telegram import (
     Update,
     InlineKeyboardMarkup,
@@ -31,37 +30,15 @@ from telegram.ext import (
     filters,
 )
 
-# Logging configuration
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook")
 PORT = int(os.getenv("PORT", "8443"))
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_PATH = os.path.join(os.path.dirname(__file__), "authkeys.db")
 
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL not found in environment variables!")
-
-# PostgreSQL connection pool
-db_pool = pg_pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=DATABASE_URL)
-
-
-def get_db_connection():
-    return db_pool.getconn()
-
-
-def release_db_connection(conn):
-    db_pool.putconn(conn)
-
-
-# Encryption setup
+# --- Encryption setup ---
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 if not ENCRYPTION_KEY:
     raise ValueError("ENCRYPTION_KEY not found in environment variables!")
@@ -76,26 +53,16 @@ def decrypt_value(value: str) -> str:
     return FERNET.decrypt(value.encode()).decode()
 
 
-# Rate limiting setup with cleanup
+# --- Rate limiting setup ---
 RATE_LIMIT_SECONDS = 3
 _last_command_time: dict[int, float] = {}
-
-
-def _cleanup_rate_limiter():
-    now = time.monotonic()
-    stale = [uid for uid, t in _last_command_time.items() if now - t > 60]
-    for uid in stale:
-        del _last_command_time[uid]
 
 
 def rate_limit(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.effective_user or not update.message:
-            return await func(update, context)
         user_id = update.effective_user.id
         now = time.monotonic()
-        _cleanup_rate_limiter()
         last_time = _last_command_time.get(user_id, 0)
         if now - last_time < RATE_LIMIT_SECONDS:
             wait = round(RATE_LIMIT_SECONDS - (now - last_time), 1)
@@ -106,171 +73,208 @@ def rate_limit(func):
     return wrapper
 
 
-FREE_DAILY_CREDITS = 10
-TRIAL_PERIOD_DAYS = 7
-SUBSCRIPTION_DAYS = 30
-SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "100"))
-GUEST_DAILY_CREDITS = 5
+# --- Credit plan setup (free trial + subscription) ---
+# Credits are only spent by /numeric, /alphanumeric, and the "Regenerate" button — these are
+# the only actions that mint a new key. /save, /find, /delete, /delete_all_my_data, and
+# /export_my_data are free to use as often as needed; they don't consume credits.
+FREE_DAILY_CREDITS = 10     # free users get this many credits per day
+TRIAL_PERIOD_DAYS = 7       # free tier lasts this many days from first use
+SUBSCRIPTION_DAYS = 30      # a paid subscription grants unlimited credits for this many days
+SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "100"))  # price in Telegram Stars
+GUEST_DAILY_CREDITS = 5  # separate, flat daily cap for @mention guest replies in chats the bot isn't a member of
 
+# --- Contact / policy links ---
 TELEGRAM_CONTACT_USERNAME = "sirchidiya"
 TELEGRAM_CONTACT_URL = f"https://t.me/{TELEGRAM_CONTACT_USERNAME}"
+# Set this to wherever you host the generated privacy_policy.html (e.g. GitHub Pages, Netlify).
 PRIVACY_POLICY_URL = os.getenv("PRIVACY_POLICY_URL", "https://sirchidiya-svg.github.io/telegram-authkeys-bot/privacy-policy.html")
 
 
-def generate_numeric_key(length=8) -> str:
-    return "".join(secrets.choice(string.digits) for _ in range(length))
+def generate_numeric_key(length=8):
+    """Generate a numeric key of specified length"""
+    return "".join(random.choices(string.digits, k=length))
 
 
-def generate_alphanumeric_key(length=8) -> str:
+def generate_alphanumeric_key(length=8):
+    """Generate an alphanumeric key of specified length.
+    Guarantees at least one letter AND one digit — plain random.choices() over the
+    full 36-char pool could (and sometimes did) produce all-letter keys by chance."""
     if length < 2:
-        chars = string.ascii_uppercase + string.digits
-        return "".join(secrets.choice(chars) for _ in range(length))
+        characters = string.ascii_uppercase + string.digits
+        return "".join(random.choices(characters, k=length))
 
     all_chars = string.ascii_uppercase + string.digits
-    key_chars = [secrets.choice(string.ascii_uppercase), secrets.choice(string.digits)]
-    key_chars += [secrets.choice(all_chars) for _ in range(length - 2)]
-
-    for i in range(len(key_chars) - 1, 0, -1):
-        j = secrets.randbelow(i + 1)
-        key_chars[i], key_chars[j] = key_chars[j], key_chars[i]
+    guaranteed = [random.choice(string.ascii_uppercase), random.choice(string.digits)]
+    remaining = random.choices(all_chars, k=length - 2)
+    key_chars = guaranteed + remaining
+    random.shuffle(key_chars)
     return "".join(key_chars)
 
 
 def init_db() -> None:
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
+    """Initialize the SQLite database and saved_keys table."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_keys (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER,
+                saved_by_name TEXT,
+                title TEXT NOT NULL,
+                details TEXT NOT NULL,
+                generated_key TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, chat_id, title)
+            )
+            """
+        )
+        cursor = conn.execute("PRAGMA table_info(saved_keys)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "generated_key" not in columns:
+            conn.execute("ALTER TABLE saved_keys ADD COLUMN generated_key TEXT")
+        if "chat_id" not in columns:
+            conn.execute("ALTER TABLE saved_keys ADD COLUMN chat_id INTEGER")
+        if "saved_by_name" not in columns:
+            conn.execute("ALTER TABLE saved_keys ADD COLUMN saved_by_name TEXT")
+
+        # If the table still has the old UNIQUE(user_id, title) constraint (pre-team-sharing
+        # deployments), rebuild it with the new constraint. Existing rows are preserved;
+        # their chat_id/saved_by_name will be NULL since that context wasn't tracked before.
+        cursor = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='saved_keys'"
+        )
+        row = cursor.fetchone()
+        existing_sql = row[0] if row else ""
+        if existing_sql and "UNIQUE(user_id, chat_id, title)" not in existing_sql:
+            conn.execute("ALTER TABLE saved_keys RENAME TO saved_keys_old")
+            conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS saved_keys (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    chat_id BIGINT,
+                CREATE TABLE saved_keys (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    chat_id INTEGER,
                     saved_by_name TEXT,
                     title TEXT NOT NULL,
                     details TEXT NOT NULL,
                     generated_key TEXT,
                     created_at TEXT NOT NULL,
                     UNIQUE(user_id, chat_id, title)
-                );
+                )
                 """
             )
-            cursor.execute(
+            conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    trial_start TEXT NOT NULL,
-                    subscription_expires TEXT
-                );
+                INSERT INTO saved_keys (id, user_id, chat_id, saved_by_name, title, details, generated_key, created_at)
+                SELECT id, user_id, chat_id, saved_by_name, title, details, generated_key, created_at FROM saved_keys_old
                 """
             )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS usage_log (
-                    user_id BIGINT NOT NULL,
-                    usage_date TEXT NOT NULL,
-                    count INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (user_id, usage_date)
-                );
-                """
+            conn.execute("DROP TABLE saved_keys_old")
+
+        # --- Usage plan tables ---
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                trial_start TEXT NOT NULL,
+                subscription_expires TEXT
             )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS generated_keys (
-                    chat_id BIGINT NOT NULL,
-                    message_id BIGINT NOT NULL,
-                    key_value TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (chat_id, message_id)
-                );
-                """
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usage_log (
+                user_id INTEGER NOT NULL,
+                usage_date TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, usage_date)
             )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS group_settings (
-                    chat_id BIGINT PRIMARY KEY,
-                    sharing_enabled INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL
-                );
-                """
+            """
+        )
+
+        # --- Generated-key tags (so /save can verify a replied-to message is a real bot-generated key) ---
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generated_keys (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                key_value TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
             )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guest_usage_log (
-                    user_id BIGINT NOT NULL,
-                    usage_date TEXT NOT NULL,
-                    count INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (user_id, usage_date)
-                );
-                """
+            """
+        )
+
+        # --- Per-group team sharing toggle ---
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_settings (
+                chat_id INTEGER PRIMARY KEY,
+                sharing_enabled INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
             )
-            conn.commit()
-    finally:
-        release_db_connection(conn)
+            """
+        )
+
+        # --- Guest-mode (@mention in chats the bot isn't in) usage cap — separate from the main plan ---
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guest_usage_log (
+                user_id INTEGER NOT NULL,
+                usage_date TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, usage_date)
+            )
+            """
+        )
 
 
 def is_sharing_enabled(chat_id: int) -> bool:
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT sharing_enabled FROM group_settings WHERE chat_id = %s;", (chat_id,))
-            row = cursor.fetchone()
-            return bool(row[0]) if row else False
-    finally:
-        release_db_connection(conn)
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT sharing_enabled FROM group_settings WHERE chat_id = ?", (chat_id,)
+        )
+        row = cursor.fetchone()
+        return bool(row[0]) if row else False
 
 
 def set_sharing_enabled(chat_id: int, enabled: bool) -> None:
     updated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO group_settings (chat_id, sharing_enabled, updated_at)
-                VALUES (%s, %s, %s)
-                ON CONFLICT(chat_id) DO UPDATE SET
-                    sharing_enabled = EXCLUDED.sharing_enabled,
-                    updated_at = EXCLUDED.updated_at;
-                """,
-                (chat_id, 1 if enabled else 0, updated_at),
-            )
-            conn.commit()
-    finally:
-        release_db_connection(conn)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO group_settings (chat_id, sharing_enabled, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET sharing_enabled = excluded.sharing_enabled, updated_at = excluded.updated_at
+            """,
+            (chat_id, 1 if enabled else 0, updated_at),
+        )
 
 
 def get_guest_usage_count(user_id: int) -> int:
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT count FROM guest_usage_log WHERE user_id = %s AND usage_date = %s;", (user_id, today))
-            row = cursor.fetchone()
-            return row[0] if row else 0
-    finally:
-        release_db_connection(conn)
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT count FROM guest_usage_log WHERE user_id = ? AND usage_date = ?",
+            (user_id, today),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else 0
 
 
 def increment_guest_usage(user_id: int) -> None:
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO guest_usage_log (user_id, usage_date, count)
-                VALUES (%s, %s, 1)
-                ON CONFLICT(user_id, usage_date) DO UPDATE SET count = guest_usage_log.count + 1;
-                """,
-                (user_id, today),
-            )
-            conn.commit()
-    finally:
-        release_db_connection(conn)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO guest_usage_log (user_id, usage_date, count) VALUES (?, ?, 1)
+            ON CONFLICT(user_id, usage_date) DO UPDATE SET count = count + 1
+            """,
+            (user_id, today),
+        )
 
 
 def check_guest_credit_allowed(user_id: int) -> tuple[bool, str]:
+    """Flat 5/day credit cap for guest @mention replies — independent of trial/subscription status."""
     used_today = get_guest_usage_count(user_id)
     if used_today >= GUEST_DAILY_CREDITS:
         return False, (
@@ -281,168 +285,180 @@ def check_guest_credit_allowed(user_id: int) -> tuple[bool, str]:
     return True, ""
 
 
-def save_record(user_id: int, chat_id: int, saved_by_name: str, title: str, details: str, generated_key: str | None = None) -> str:
+def save_record(
+    user_id: int,
+    chat_id: int,
+    saved_by_name: str,
+    title: str,
+    details: str,
+    generated_key: str | None = None,
+) -> str:
     created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     encrypted_details = encrypt_value(details)
     encrypted_key = encrypt_value(generated_key) if generated_key else None
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO saved_keys
-                    (user_id, chat_id, saved_by_name, title, details, generated_key, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT(user_id, chat_id, title) DO UPDATE SET
-                    saved_by_name = EXCLUDED.saved_by_name,
-                    details = EXCLUDED.details,
-                    generated_key = EXCLUDED.generated_key,
-                    created_at = EXCLUDED.created_at;
-                """,
-                (user_id, chat_id, saved_by_name, title, encrypted_details, encrypted_key, created_at),
-            )
-            conn.commit()
-            return created_at
-    finally:
-        release_db_connection(conn)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO saved_keys
+                (user_id, chat_id, saved_by_name, title, details, generated_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, chat_id, saved_by_name, title, encrypted_details, encrypted_key, created_at),
+        )
+    return created_at
 
 
 def tag_generated_key(chat_id: int, message_id: int, key_value: str) -> None:
+    """Record that a specific message in a specific chat contains a bot-generated key.
+    Called right after sending/regenerating a key so /save can later verify a reply is legit."""
     created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     encrypted_key = encrypt_value(key_value)
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO generated_keys (chat_id, message_id, key_value, created_at)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT(chat_id, message_id) DO UPDATE SET
-                    key_value = EXCLUDED.key_value,
-                    created_at = EXCLUDED.created_at;
-                """,
-                (chat_id, message_id, encrypted_key, created_at),
-            )
-            conn.commit()
-    finally:
-        release_db_connection(conn)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO generated_keys (chat_id, message_id, key_value, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, message_id, encrypted_key, created_at),
+        )
 
 
 def get_tagged_key(chat_id: int, message_id: int) -> str | None:
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT key_value FROM generated_keys WHERE chat_id = %s AND message_id = %s;", (chat_id, message_id))
-            row = cursor.fetchone()
-            return decrypt_value(row[0]) if row else None
-    finally:
-        release_db_connection(conn)
+    """Look up the bot-generated key attached to a specific message, if any."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT key_value FROM generated_keys WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return decrypt_value(row[0])
 
 
 def find_record(user_id: int, chat_id: int, title: str, team_mode: bool = False):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            if team_mode:
-                cursor.execute(
-                    "SELECT details, generated_key, created_at, saved_by_name FROM saved_keys WHERE chat_id = %s AND title = %s;",
-                    (chat_id, title),
-                )
-            else:
-                cursor.execute(
-                    "SELECT details, generated_key, created_at, saved_by_name FROM saved_keys WHERE user_id = %s AND chat_id = %s AND title = %s;",
-                    (user_id, chat_id, title),
-                )
-            row = cursor.fetchone()
-            if not row:
-                return None
-            details, generated_key, created_at, saved_by_name = row
-            return decrypt_value(details), decrypt_value(generated_key) if generated_key else None, created_at, saved_by_name
-    finally:
-        release_db_connection(conn)
+    """Look up a saved entry.
+    - team_mode=False: only the requesting user's own entry, scoped to this chat.
+    - team_mode=True: any teammate's entry saved in this chat (group sharing must be on)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        if team_mode:
+            cursor = conn.execute(
+                "SELECT details, generated_key, created_at, saved_by_name FROM saved_keys "
+                "WHERE chat_id = ? AND title = ?",
+                (chat_id, title),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT details, generated_key, created_at, saved_by_name FROM saved_keys "
+                "WHERE user_id = ? AND chat_id = ? AND title = ?",
+                (user_id, chat_id, title),
+            )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        details, generated_key, created_at, saved_by_name = row
+        decrypted_details = decrypt_value(details)
+        decrypted_key = decrypt_value(generated_key) if generated_key else None
+        return decrypted_details, decrypted_key, created_at, saved_by_name
 
 
 def delete_record(user_id: int, chat_id: int, title: str) -> bool:
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM saved_keys WHERE user_id = %s AND chat_id = %s AND title = %s;", (user_id, chat_id, title))
-            conn.commit()
-            return cursor.rowcount > 0
-    finally:
-        release_db_connection(conn)
+    """Delete only entries the requesting user owns — sharing never grants delete rights over others' data."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "DELETE FROM saved_keys WHERE user_id = ? AND chat_id = ? AND title = ?",
+            (user_id, chat_id, title),
+        )
+        return cursor.rowcount > 0
 
 
 def delete_all_records(user_id: int) -> int:
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM saved_keys WHERE user_id = %s;", (user_id,))
-            conn.commit()
-            return cursor.rowcount
-    finally:
-        release_db_connection(conn)
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "DELETE FROM saved_keys WHERE user_id = ?",
+            (user_id,),
+        )
+        return cursor.rowcount
 
 
 def find_all_records(user_id: int, chat_id: int):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT title, details, generated_key, created_at, saved_by_name FROM saved_keys WHERE user_id = %s AND chat_id = %s ORDER BY created_at;",
-                (user_id, chat_id),
-            )
-            rows = cursor.fetchall()
-        return [(t, decrypt_value(d), decrypt_value(k) if k else None, ca, sbn) for t, d, k, ca, sbn in rows]
-    finally:
-        release_db_connection(conn)
+    """Export the requesting user's own entries, scoped to THIS chat only.
+    Never spans chats — a DM export must not be able to pull in group-saved entries
+    or vice versa, and a group export must not pull in the user's other groups/DMs."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT title, details, generated_key, created_at, saved_by_name FROM saved_keys "
+            "WHERE user_id = ? AND chat_id = ? ORDER BY created_at",
+            (user_id, chat_id),
+        )
+        rows = cursor.fetchall()
+
+    decrypted_rows = []
+    for title, details, generated_key, created_at, saved_by_name in rows:
+        decrypted_details = decrypt_value(details)
+        decrypted_key = decrypt_value(generated_key) if generated_key else None
+        decrypted_rows.append((title, decrypted_details, decrypted_key, created_at, saved_by_name))
+    return decrypted_rows
 
 
 def find_all_team_records(chat_id: int):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT title, details, generated_key, created_at, saved_by_name FROM saved_keys WHERE chat_id = %s ORDER BY created_at;",
-                (chat_id,),
-            )
-            rows = cursor.fetchall()
-        return [(t, decrypt_value(d), decrypt_value(k) if k else None, ca, sbn) for t, d, k, ca, sbn in rows]
-    finally:
-        release_db_connection(conn)
+    """Export every teammate's entries saved in THIS group — only used when team sharing
+    is ON for the group. Still scoped to a single chat_id, so other groups and DMs
+    (the caller's own or anyone else's) are never included."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT title, details, generated_key, created_at, saved_by_name FROM saved_keys "
+            "WHERE chat_id = ? ORDER BY created_at",
+            (chat_id,),
+        )
+        rows = cursor.fetchall()
 
+    decrypted_rows = []
+    for title, details, generated_key, created_at, saved_by_name in rows:
+        decrypted_details = decrypt_value(details)
+        decrypted_key = decrypt_value(generated_key) if generated_key else None
+        decrypted_rows.append((title, decrypted_details, decrypted_key, created_at, saved_by_name))
+    return decrypted_rows
+
+
+# --- Usage plan helpers ---
 
 def get_or_create_user(user_id: int) -> dict:
+    """Fetch a user's plan row, creating one (and starting their trial) on first use."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT user_id, trial_start, subscription_expires FROM users WHERE user_id = %s;", (user_id,))
-            row = cursor.fetchone()
-            if row:
-                return {"user_id": row[0], "trial_start": row[1], "subscription_expires": row[2]}
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT user_id, trial_start, subscription_expires FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        if row:
+            return {"user_id": row[0], "trial_start": row[1], "subscription_expires": row[2]}
 
-            cursor.execute("INSERT INTO users (user_id, trial_start, subscription_expires) VALUES (%s, %s, NULL);", (user_id, today))
-            conn.commit()
-            return {"user_id": user_id, "trial_start": today, "subscription_expires": None}
-    finally:
-        release_db_connection(conn)
+        conn.execute(
+            "INSERT INTO users (user_id, trial_start, subscription_expires) VALUES (?, ?, NULL)",
+            (user_id, today),
+        )
+        return {"user_id": user_id, "trial_start": today, "subscription_expires": None}
 
 
 def is_subscribed(user_row: dict) -> bool:
+    """Return True if the user currently has an active (unexpired) subscription."""
     expires = user_row.get("subscription_expires")
     if not expires:
         return False
     try:
         expires_dt = datetime.strptime(expires, "%Y-%m-%d %H:%M:%S")
-        return datetime.utcnow() < expires_dt
     except ValueError:
         return False
+    return datetime.utcnow() < expires_dt
 
 
 def grant_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS) -> str:
+    """Activate (or extend) a user's subscription. Returns the new expiry timestamp string.
+
+    Hook this up to your Telegram Stars payment handler once that's wired in.
+    """
     user_row = get_or_create_user(user_id)
     now = datetime.utcnow()
+
     current_expiry = None
     if user_row["subscription_expires"]:
         try:
@@ -450,70 +466,85 @@ def grant_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS) -> str:
         except ValueError:
             current_expiry = None
 
+    # Extend from current expiry if still active, otherwise start fresh from now
     base = current_expiry if current_expiry and current_expiry > now else now
-    new_expiry_str = (base + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    new_expiry = base + timedelta(days=days)
+    new_expiry_str = new_expiry.strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("UPDATE users SET subscription_expires = %s WHERE user_id = %s;", (new_expiry_str, user_id))
-            conn.commit()
-        return new_expiry_str
-    finally:
-        release_db_connection(conn)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE users SET subscription_expires = ? WHERE user_id = ?",
+            (new_expiry_str, user_id),
+        )
+    return new_expiry_str
 
 
 def get_today_credit_usage(user_id: int) -> int:
+    """Reads from usage_log — table name kept as-is to avoid a migration; it now tracks
+    credit spend specifically (only /numeric, /alphanumeric, and Regenerate write to it)."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT count FROM usage_log WHERE user_id = %s AND usage_date = %s;", (user_id, today))
-            row = cursor.fetchone()
-            return row[0] if row else 0
-    finally:
-        release_db_connection(conn)
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "SELECT count FROM usage_log WHERE user_id = ? AND usage_date = ?",
+            (user_id, today),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else 0
 
 
 def increment_credit_usage(user_id: int) -> None:
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO usage_log (user_id, usage_date, count)
-                VALUES (%s, %s, 1)
-                ON CONFLICT(user_id, usage_date) DO UPDATE SET count = usage_log.count + 1;
-                """,
-                (user_id, today),
-            )
-            conn.commit()
-    finally:
-        release_db_connection(conn)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO usage_log (user_id, usage_date, count) VALUES (?, ?, 1)
+            ON CONFLICT(user_id, usage_date) DO UPDATE SET count = count + 1
+            """,
+            (user_id, today),
+        )
 
 
 def check_credit_allowed(user_id: int) -> tuple[bool, str]:
+    """Core credit-enforcement check. Only called for actions that mint a new key:
+    /numeric, /alphanumeric, and the "Regenerate" button.
+
+    - Active subscribers: unlimited credits (for SUBSCRIPTION_DAYS from activation/extension).
+    - Free users: FREE_DAILY_CREDITS/day, only during the first TRIAL_PERIOD_DAYS days
+      since their first-ever use. After that, they must subscribe.
+    Returns (allowed, message_if_blocked).
+    """
     user_row = get_or_create_user(user_id)
+
     if is_subscribed(user_row):
-        increment_credit_usage(user_id)
+        increment_credit_usage(user_id)  # tracked for stats only, doesn't block
         return True, ""
 
     trial_start = datetime.strptime(user_row["trial_start"], "%Y-%m-%d")
     days_elapsed = (datetime.utcnow() - trial_start).days
 
     if days_elapsed >= TRIAL_PERIOD_DAYS:
-        return False, "🚫 Your 7-day free trial has ended.\nSubscribe to unlock 30 days of unlimited credits — see /subscribe."
+        return False, (
+            "🚫 Your 7-day free trial has ended.\n"
+            "Subscribe to unlock 30 days of unlimited credits — see /subscribe."
+        )
 
     today_count = get_today_credit_usage(user_id)
     if today_count >= FREE_DAILY_CREDITS:
-        return False, f"🚫 You've used today's {FREE_DAILY_CREDITS} free credits.\nCome back tomorrow, or subscribe for unlimited credits — see /subscribe."
+        return False, (
+            f"🚫 You've used today's {FREE_DAILY_CREDITS} free credits.\n"
+            f"Come back tomorrow, or subscribe for unlimited credits — see /subscribe."
+        )
 
     increment_credit_usage(user_id)
     return True, ""
 
 
 def credit_limit(func):
+    """Decorator that spends a credit before running a command. Only apply this to
+    /numeric and /alphanumeric — the "Regenerate" button checks credits directly in
+    handle_callback since it's a button press, not a command. No other command
+    (/save, /find, /delete, /delete_all_my_data, /export_my_data) should carry this —
+    they don't mint new keys, so they stay free to use."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -556,6 +587,7 @@ def build_welcome_keyboard() -> InlineKeyboardMarkup:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /start is issued."""
     await update.message.reply_text(
         build_welcome_message(), parse_mode="MarkdownV2", reply_markup=build_welcome_keyboard()
     )
@@ -564,10 +596,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @rate_limit
 @credit_limit
 async def generate_numeric(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate and send a numeric key with regenerate button"""
     key = generate_numeric_key()
-    keyboard = [[InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate_numeric")]]
+
+    keyboard = [
+        [InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate_numeric")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     sent_message = await update.message.reply_text(
-        f"🔑 Numeric Key: `{key}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+        f"🔑 Numeric Key: `{key}`", parse_mode="Markdown", reply_markup=reply_markup
     )
     tag_generated_key(sent_message.chat_id, sent_message.message_id, key)
 
