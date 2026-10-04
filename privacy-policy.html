@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy Policy - AuthKeys Generator Bot</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-200 antialiased min-h-screen selection:bg-cyan-500 selection:text-white">
+
+    <!-- Top Navigation / Header -->
+    <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50">
+        <div class="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center font-bold text-white text-lg shadow-lg shadow-cyan-500/20">
+                    🔑
+                </div>
+                <div>
+                    <h1 class="text-base font-semibold text-white tracking-tight">AuthKeys Bot</h1>
+                    <p class="text-xs text-slate-400">Privacy & Data Governance</p>
+                </div>
+            </div>
+            <a href="https://t.me/AuthKeys_Bot" target="_blank" rel="noopener noreferrer" 
+               class="text-xs sm:text-sm px-3.5 py-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 transition-all duration-200 font-medium flex items-center gap-1.5">
+                <span>Open Bot</span>
+                <span>↗</span>
+            </a>
+        </div>
+    </header>
+
+    <!-- Main Content Container -->
+    <main class="max-w-4xl mx-auto px-4 py-10 sm:py-14 space-y-10">
+
+        <!-- Header Hero -->
+        <div class="border-b border-slate-800 pb-8 space-y-3">
+            <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                Effective Date: October 2026
+            </div>
+            <h2 class="text-2xl sm:text-3xl font-bold text-white tracking-tight">Privacy Policy & Transparency Notice</h2>
+            <p class="text-slate-400 text-sm sm:text-base leading-relaxed">
+                This document explains how <strong class="text-slate-200">AuthKeys Generator Bot</strong> (@AuthKeys_Bot) handles, stores, and protects user data, authentication keys, and transaction logs. We strictly uphold a zero-knowledge approach for your credentials through client-isolated cryptographic encryption.
+            </p>
+        </div>
+
+        <!-- Section 1: Overview -->
+        <section class="space-y-4">
+            <h3 class="text-lg font-semibold text-white flex items-center gap-2">
+                <span class="text-cyan-400">1.</span> Core Principles
+            </h3>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
+                <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-2">
+                    <div class="text-cyan-400 text-xl">🔐</div>
+                    <div class="font-semibold text-white">Military-Grade Encryption</div>
+                    <p class="text-slate-400 text-xs leading-relaxed">All saved keys and descriptions are encrypted at rest with AES-128-CBC via Fernet cryptography before touching persistent disk.</p>
+                </div>
+                <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-2">
+                    <div class="text-cyan-400 text-xl">🚫</div>
+                    <div class="font-semibold text-white">Zero Tracking or Ads</div>
+                    <p class="text-slate-400 text-xs leading-relaxed">We do not profile your usage, sell data to advertisers, or scrape messages. We only process commands you trigger.</p>
+                </div>
+                <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-2">
+                    <div class="text-cyan-400 text-xl">🗑️</div>
+                    <div class="font-semibold text-white">Total Data Sovereignty</div>
+                    <p class="text-slate-400 text-xs leading-relaxed">You retain full right of erasure. Execute <code class="text-cyan-300">/delete_all_my_data</code> at any time to purge all your records immediately.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Section 2: Data We Process -->
+        <section class="space-y-4">
+            <h3 class="text-lg font-semibold text-white flex items-center gap-2">
+                <span class="text-cyan-400">2.</span> Information We Collect and Process
+            </h3>
+            <p class="text-sm text-slate-300 leading-relaxed">
+                When you interact with the bot through direct messages, group chats, or inline queries, we only process the technical data necessary to perform the requested operation:
+            </p>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs sm:text-sm border border-slate-800 rounded-xl overflow-hidden">
+                    <thead class="bg-slate-900 text-slate-300 border-b border-slate-800 font-semibold">
+                        <tr>
+                            <th class="p-3">Data Field</th>
+                            <th class="p-3">Source & Purpose</th>
+                            <th class="p-3">Storage State</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-800/80 bg-slate-900/40 text-slate-400">
+                        <tr>
+                            <td class="p-3 font-mono text-cyan-300 text-xs">user_id & chat_id</td>
+                            <td class="p-3">Telegram numeric identifiers used to enforce daily quotas, subscriptions, and team permissions.</td>
+                            <td class="p-3 text-slate-300">Plaintext (Primary Keys)</td>
+                        </tr>
+                        <tr>
+                            <td class="p-3 font-mono text-cyan-300 text-xs">Saved Key & Details</td>
+                            <td class="p-3">Your custom labels, API credentials, and saved generated keys.</td>
+                            <td class="p-3 text-emerald-400 font-medium">Fernet Encrypted (Ciphertext)</td>
+                        </tr>
+                        <tr>
+                            <td class="p-3 font-mono text-cyan-300 text-xs">Payment Charge ID</td>
+                            <td class="p-3">Telegram Stars charge identifier used to verify subscription validity and process refunds.</td>
+                            <td class="p-3 text-slate-300">Indexed for audit & refunds</td>
+                        </tr>
+                        <tr>
+                            <td class="p-3 font-mono text-cyan-300 text-xs">Inline Queries</td>
+                            <td class="p-3">Ephemeral generation requests triggered by <code class="text-cyan-300">@AuthKeys_Bot</code>.</td>
+                            <td class="p-3 text-emerald-400 font-medium">Never stored / Discarded instantly</td>
+                        </tr>
+                        <tr>
+                            <td class="p-3 font-mono text-cyan-300 text-xs">Feedback Submissions</td>
+                            <td class="p-3">Feedback messages, bug reports, and screenshots submitted via <code class="text-cyan-300">/feedback</code>.</td>
+                            <td class="p-3 text-slate-300">Routed to Admin & not retained in DB</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Section 3: Telegram Stars & Refund Policy -->
+        <section class="space-y-4">
+            <h3 class="text-lg font-semibold text-white flex items-center gap-2">
+                <span class="text-cyan-400">3.</span> Telegram Stars & Refund Policy
+            </h3>
+            <div class="bg-slate-900 border border-slate-800 p-5 rounded-xl space-y-3 text-sm text-slate-300 leading-relaxed">
+                <p>
+                    All monetary transactions are carried out using <strong>Telegram Stars (XTR)</strong>. AuthKeys Bot does not process, receive, or store your credit card numbers, bank details, or personal billing addresses.
+                </p>
+                <div class="space-y-2 border-l-2 border-cyan-500 pl-4 my-2">
+                    <p class="font-medium text-white">Self-Service Refund System:</p>
+                    <p class="text-xs sm:text-sm text-slate-400">
+                        Subscribers may request a refund at any point directly within Telegram using the <code class="text-cyan-300 font-mono">/paysupport</code> command. Upon confirmation, the bot alerts our administration team with your verified charge identifier. Once authorized, Telegram's API instantly returns your Stars to your balance and your subscription is terminated.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Section 4: Data Retention & User Rights -->
+        <section class="space-y-4">
+            <h3 class="text-lg font-semibold text-white flex items-center gap-2">
+                <span class="text-cyan-400">4.</span> Your Rights & Data Erasure
+            </h3>
+            <p class="text-sm text-slate-300 leading-relaxed">
+                Under the General Data Protection Regulation (GDPR), California Consumer Privacy Act (CCPA), and Telegram Developer Standards, you hold unconditional rights over your stored content:
+            </p>
+            <ul class="space-y-2 text-sm text-slate-400 list-disc list-inside">
+                <li><strong class="text-slate-200">Right to Access / Portability:</strong> Export all records created within the current chat using <code class="text-cyan-300 font-mono">/export_my_data</code>.</li>
+                <li><strong class="text-slate-200">Right to Rectification & Deletion:</strong> Delete individual titles with <code class="text-cyan-300 font-mono">/delete {title}</code>.</li>
+                <li><strong class="text-slate-200">Right to Complete Erasure:</strong> Purge every single record attached to your account across all chats permanently using <code class="text-cyan-300 font-mono">/delete_all_my_data</code>.</li>
+            </ul>
+        </section>
+
+        <!-- Section 5: Team Sharing in Groups -->
+        <section class="space-y-4">
+            <h3 class="text-lg font-semibold text-white flex items-center gap-2">
+                <span class="text-cyan-400">5.</span> Group Chats & Team Sharing
+            </h3>
+            <p class="text-sm text-slate-300 leading-relaxed">
+                When added to Telegram groups, team sharing is disabled by default. Only verified group administrators can toggle sharing on or off using <code class="text-cyan-300 font-mono">/team_sharing on|off</code>. When enabled, team members can retrieve group-scoped saved entries, with the contributor's display name clearly credited.
+            </p>
+        </section>
+
+        <!-- Section 6: Contact & Support -->
+        <section class="bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-800 p-6 rounded-2xl space-y-4">
+            <h3 class="text-lg font-semibold text-white">Questions & Data Protection Requests</h3>
+            <p class="text-sm text-slate-400 leading-relaxed">
+                For questions regarding data processing, security disclosures, or enterprise licensing, you can reach out via in-bot feedback (<code class="text-cyan-300 font-mono">/feedback</code>) or directly contact the developer:
+            </p>
+            <div class="flex flex-wrap items-center gap-3 pt-1">
+                <a href="https://t.me/sirchidiya" target="_blank" rel="noopener noreferrer" 
+                   class="px-4 py-2 rounded-xl bg-cyan-500 text-slate-950 font-semibold text-sm hover:bg-cyan-400 transition-colors duration-200 inline-flex items-center gap-2">
+                    <span>Telegram: @sirchidiya</span>
+                    <span>↗</span>
+                </a>
+                <a href="https://github.com/sirchidiya-svg/telegram-authkeys-bot" target="_blank" rel="noopener noreferrer" 
+                   class="px-4 py-2 rounded-xl bg-slate-800 text-slate-200 font-semibold text-sm hover:bg-slate-700 transition-colors duration-200 inline-flex items-center gap-2 border border-slate-700">
+                    <span>GitHub Repository</span>
+                    <span>↗</span>
+                </a>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="border-t border-slate-900 py-8 text-center text-xs text-slate-500">
+        <p>&copy; 2026 AuthKeys Generator Bot. All rights reserved.</p>
+        <p class="mt-1">Powered by PostgreSQL & Fernet Cryptography</p>
+    </footer>
+
+</body>
+</html>
