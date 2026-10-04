@@ -9,7 +9,7 @@ import html
 import asyncio
 import hmac
 import hashlib
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, unquote
 from datetime import datetime, timedelta
 from functools import wraps
 from contextlib import contextmanager
@@ -53,7 +53,10 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook")
 PORT = int(os.getenv("PORT", "8443"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-MINI_APP_URL = os.getenv("WEBHOOK_URL", f"http://localhost:{PORT}").rstrip("/")
+
+# Determine clean Mini App HTTPS URL
+RAW_MINI_APP_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
+MINI_APP_URL = RAW_MINI_APP_URL if RAW_MINI_APP_URL.startswith("https://") else ""
 
 # --- Encryption setup ---
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
@@ -89,7 +92,7 @@ def validate_telegram_data(init_data: str) -> dict | None:
     if not init_data or not TOKEN:
         return None
     try:
-        parsed_data = dict(parse_qsl(init_data, strict_parsing=True))
+        parsed_data = dict(parse_qsl(init_data, keep_blank_values=True))
         if "hash" not in parsed_data:
             return None
         received_hash = parsed_data.pop("hash")
@@ -98,8 +101,7 @@ def validate_telegram_data(init_data: str) -> dict | None:
         computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         if hmac.compare_digest(computed_hash, received_hash):
             import json
-            user_info = json.loads(parsed_data.get("user", "{}"))
-            return user_info
+            return json.loads(parsed_data.get("user", "{}"))
         return None
     except Exception as e:
         logger.warning(f"Failed initData validation: {e}")
@@ -537,15 +539,15 @@ def build_welcome_message() -> str:
     )
 
 def build_welcome_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🚀 Open AuthKeys Web App", web_app=WebAppInfo(url=MINI_APP_URL))],
-            [
-                InlineKeyboardButton("📋 Commands", callback_data="show_all_commands"),
-                InlineKeyboardButton("🔒 Privacy Policy", url=PRIVACY_POLICY_URL),
-            ]
-        ]
-    )
+    buttons = []
+    if MINI_APP_URL:
+        buttons.append([InlineKeyboardButton("🚀 Open AuthKeys Web App", web_app=WebAppInfo(url=MINI_APP_URL))])
+    
+    buttons.append([
+        InlineKeyboardButton("📋 Commands", callback_data="show_all_commands"),
+        InlineKeyboardButton("🔒 Privacy Policy", url=PRIVACY_POLICY_URL),
+    ])
+    return InlineKeyboardMarkup(buttons)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -596,7 +598,6 @@ def full_commands_text() -> str:
         "🔒 Privacy: saved details and keys are encrypted in the database."
     )
 
-# --- VERTICALLY STACKED /help BUTTONS ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_message = (
         "ℹ️ **AuthKeys Help & Support**\n\n"
@@ -605,12 +606,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• Issues regarding Telegram Stars purchases or refunds? Use /paysupport.\n\n"
         "All data is zero-knowledge encrypted at rest."
     )
-    keyboard = [
-        [InlineKeyboardButton("🚀 Open AuthKeys Web App", web_app=WebAppInfo(url=MINI_APP_URL))],
-        [InlineKeyboardButton("🛠️️ Report Issue (/support)", callback_data="btn_nav_support")],
+    
+    keyboard = []
+    if MINI_APP_URL:
+        keyboard.append([InlineKeyboardButton("🚀 Open AuthKeys Web App", web_app=WebAppInfo(url=MINI_APP_URL))])
+        
+    keyboard.extend([
+        [InlineKeyboardButton("🛠️ Report Issue (/support)", callback_data="btn_nav_support")],
         [InlineKeyboardButton("💡 Give Feedback (/feedback)", callback_data="btn_nav_feedback")],
         [InlineKeyboardButton("💳 Payment Support (/paysupport)", callback_data="btn_nav_paysupport")],
-    ]
+    ])
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(help_message, parse_mode="Markdown", reply_markup=reply_markup)
 
@@ -1880,16 +1885,46 @@ async def mini_app_api_vault(request: web.Request) -> web.Response:
     user_info = validate_telegram_data(init_data)
     if not user_info:
         return web.json_response({"success": False, "error": "Unauthorized Telegram session"}, status=401)
+    
     user_id = user_info.get("id")
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT title, details, generated_key FROM saved_keys WHERE user_id = %s ORDER BY created_at DESC LIMIT 30", (user_id,))
+            cursor.execute(
+                "SELECT title, details, generated_key FROM saved_keys WHERE user_id = %s ORDER BY created_at DESC LIMIT 30",
+                (user_id,)
+            )
             rows = cursor.fetchall()
+
     decrypted = []
     for t, d, k in rows:
         d_val, k_val = decrypt_row_safely(d, k)
         decrypted.append({"title": t, "details": d_val, "key": k_val})
+
     return web.json_response({"success": True, "records": decrypted})
+
+async def mini_app_api_save_key(request: web.Request) -> web.Response:
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    user_info = validate_telegram_data(init_data)
+    if not user_info:
+        return web.json_response({"success": False, "error": "Unauthorized session"}, status=401)
+    
+    try:
+        body = await request.json()
+        title = body.get("title", "").strip()
+        details = body.get("details", "").strip()
+        key_value = body.get("key", "").strip()
+
+        if not title:
+            return web.json_response({"success": False, "error": "Title required"}, status=400)
+
+        user_id = user_info.get("id")
+        user_name = user_info.get("first_name", "WebUser")
+        
+        save_record(user_id, user_id, user_name, title, details, key_value)
+        return web.json_response({"success": True})
+    except Exception as e:
+        logger.error(f"Error saving key via webapp: {e}")
+        return web.json_response({"success": False, "error": "Database error"}, status=500)
 
 def main() -> None:
     if not TOKEN:
@@ -1923,7 +1958,6 @@ def main() -> None:
     application.add_handler(CommandHandler("admin_support", admin_support_command))
     application.add_handler(CommandHandler("test_refund", test_refund_command))
 
-    # Handlers for Buttons & Payments
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
@@ -1935,7 +1969,7 @@ def main() -> None:
     application.add_handler(InlineQueryHandler(inline_query_handler))
     application.add_error_handler(error_handler)
 
-    # Combined runner for Telegram Bot + Mini App Web Server
+    # Combined runner: Bot polling + aiohttp web server for Mini App
     async def start_all():
         await application.initialize()
         await application.start()
@@ -1943,23 +1977,16 @@ def main() -> None:
         app = web.Application()
         app.router.add_get("/", mini_app_index)
         app.router.add_get("/api/vault", mini_app_api_vault)
+        app.router.add_post("/api/save_key", mini_app_api_save_key)
 
-        if WEBHOOK_URL:
-            webhook_path = "/" + WEBHOOK_PATH.lstrip("/")
-            async def telegram_webhook(request: web.Request) -> web.Response:
-                data = await request.json()
-                await application.process_update(Update.de_json(data, application.bot))
-                return web.Response()
-            app.router.add_post(webhook_path, telegram_webhook)
-            await application.bot.set_webhook(url=f"{WEBHOOK_URL.rstrip('/')}{webhook_path}")
-        else:
-            await application.updater.start_polling()
+        await application.updater.start_polling()
 
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", PORT)
         await site.start()
         logger.info(f"AuthKeys Server and Mini App running on port {PORT}")
+
         while True:
             await asyncio.sleep(3600)
 
