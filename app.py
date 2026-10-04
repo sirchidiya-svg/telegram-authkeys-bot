@@ -71,7 +71,7 @@ def decrypt_value(value: str) -> str:
     try:
         return FERNET.decrypt(value.encode()).decode()
     except InvalidToken as exc:
-        raise DecryptionError("Could not decrypt stored value") from exc
+        raise DecryptionError("Could not decrypt a stored value (wrong/changed key or corrupted data)") from exc
 
 UNREADABLE_PLACEHOLDER = "[could not be decrypted - see /support]"
 
@@ -81,7 +81,7 @@ def decrypt_row_safely(details: str, generated_key: str | None) -> tuple[str, st
         decrypted_key = decrypt_value(generated_key) if generated_key else None
         return decrypted_details, decrypted_key
     except DecryptionError:
-        logger.error("Skipped row decryption: ENCRYPTION_KEY mismatch.")
+        logger.error("Export skipped one saved row: decryption failed (check ENCRYPTION_KEY).")
         return UNREADABLE_PLACEHOLDER, None
 
 # --- Telegram InitData HMAC-SHA256 Authenticator ---
@@ -141,18 +141,21 @@ def rate_limit(func):
         return await func(update, context)
     return wrapper
 
+# --- Credit plan setup ---
 FREE_DAILY_CREDITS = 10     
 TRIAL_PERIOD_DAYS = 7       
 SUBSCRIPTION_DAYS = 30      
 SUBSCRIPTION_PRICE_STARS = int(os.getenv("SUBSCRIPTION_PRICE_STARS", "100"))  
 
+# --- Contact / policy links & icon URLs ---
 PRIVACY_POLICY_URL = os.getenv("PRIVACY_POLICY_URL", "https://sirchidiya-svg.github.io/telegram-authkeys-bot/privacy-policy.html")
 NUMERIC_ICON_URL = "https://sirchidiya-svg.github.io/telegram-authkeys-bot/numeric_icon.png"
 ALPHA_ICON_URL = "https://sirchidiya-svg.github.io/telegram-authkeys-bot/alpha_icon.png"
 
 DECRYPT_FAIL_MESSAGE = (
-    "⚠️ I couldn't unlock that saved entry.\n\n"
-    "This usually means the bot's encryption key was changed or lost. Your entry has not been deleted.\n"
+    "⚠ I couldn't unlock that saved entry.\n\n"
+    "This usually means the bot's encryption key was changed or lost, so older entries "
+    "can't be read any more. Your entry has not been deleted.\n"
     "Please send an issue report using /support for assistance."
 )
 
@@ -274,6 +277,7 @@ def init_db() -> None:
                 );
                 """
             )
+            cursor.execute("ALTER TABLE refund_requests ADD COLUMN IF NOT EXISTS admin_notes TEXT")
 
 def is_sharing_enabled(chat_id: int) -> bool:
     with get_db_connection() as conn:
@@ -377,7 +381,12 @@ def find_all_records(user_id: int, chat_id: int):
                 (user_id, chat_id),
             )
             rows = cursor.fetchall()
-    return [(t, *decrypt_row_safely(d, k), c, s) for t, d, k, c, s in rows]
+
+    decrypted_rows = []
+    for title, details, generated_key, created_at, saved_by_name in rows:
+        decrypted_details, decrypted_key = decrypt_row_safely(details, generated_key)
+        decrypted_rows.append((title, decrypted_details, decrypted_key, created_at, saved_by_name))
+    return decrypted_rows
 
 def find_all_team_records(chat_id: int):
     with get_db_connection() as conn:
@@ -387,7 +396,12 @@ def find_all_team_records(chat_id: int):
                 (chat_id,),
             )
             rows = cursor.fetchall()
-    return [(t, *decrypt_row_safely(d, k), c, s) for t, d, k, c, s in rows]
+
+    decrypted_rows = []
+    for title, details, generated_key, created_at, saved_by_name in rows:
+        decrypted_details, decrypted_key = decrypt_row_safely(details, generated_key)
+        decrypted_rows.append((title, decrypted_details, decrypted_key, created_at, saved_by_name))
+    return decrypted_rows
 
 def get_or_create_user(user_id: int) -> dict:
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -397,6 +411,7 @@ def get_or_create_user(user_id: int) -> dict:
             row = cursor.fetchone()
             if row:
                 return {"user_id": row[0], "trial_start": row[1], "subscription_expires": row[2]}
+
             cursor.execute("INSERT INTO users (user_id, trial_start, subscription_expires) VALUES (%s, %s, NULL)", (user_id, today))
             return {"user_id": user_id, "trial_start": today, "subscription_expires": None}
 
@@ -405,21 +420,26 @@ def is_subscribed(user_row: dict) -> bool:
     if not expires:
         return False
     try:
-        return datetime.utcnow() < datetime.strptime(expires, "%Y-%m-%d %H:%M:%S")
+        expires_dt = datetime.strptime(expires, "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return False
+    return datetime.utcnow() < expires_dt
 
 def grant_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS) -> str:
     user_row = get_or_create_user(user_id)
     now = datetime.utcnow()
+
     current_expiry = None
     if user_row["subscription_expires"]:
         try:
             current_expiry = datetime.strptime(user_row["subscription_expires"], "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            pass
+            current_expiry = None
+
     base = current_expiry if current_expiry and current_expiry > now else now
-    new_expiry_str = (base + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    new_expiry = base + timedelta(days=days)
+    new_expiry_str = new_expiry.strftime("%Y-%m-%d %H:%M:%S")
+
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("UPDATE users SET subscription_expires = %s WHERE user_id = %s", (new_expiry_str, user_id))
@@ -447,21 +467,29 @@ def increment_credit_usage(user_id: int) -> None:
 
 def check_credit_allowed(user_id: int) -> tuple[bool, str]:
     user_row = get_or_create_user(user_id)
+
     if is_subscribed(user_row):
-        increment_credit_usage(user_id)
+        increment_credit_usage(user_id) 
         return True, ""
+
     trial_start = datetime.strptime(user_row["trial_start"], "%Y-%m-%d")
-    if (datetime.utcnow() - trial_start).days >= TRIAL_PERIOD_DAYS:
+    days_elapsed = (datetime.utcnow() - trial_start).days
+
+    if days_elapsed >= TRIAL_PERIOD_DAYS:
         return False, "🚫 Your 7-day free trial has ended.\nSubscribe to unlock 30 days of unlimited credits — see /subscribe."
-    if get_today_credit_usage(user_id) >= FREE_DAILY_CREDITS:
+
+    today_count = get_today_credit_usage(user_id)
+    if today_count >= FREE_DAILY_CREDITS:
         return False, f"🚫 You've used today's {FREE_DAILY_CREDITS} free credits.\nCome back tomorrow, or subscribe for unlimited credits — see /subscribe."
+
     increment_credit_usage(user_id)
     return True, ""
 
 def credit_limit(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        allowed, reason = check_credit_allowed(update.effective_user.id)
+        user_id = update.effective_user.id
+        allowed, reason = check_credit_allowed(user_id)
         if not allowed:
             await update.message.reply_text(reason)
             return
@@ -499,40 +527,54 @@ def build_welcome_message() -> str:
         "/support \\- Report a technical issue, bug, or glitch\n"
         "/feedback \\- Share what you like or suggest new features\n"
         "/help \\- Information on commands and bot usage\n\n"
+        "*Example usage:*\n"
+        "/numeric \\- Gets a key like: `47392615`\n"
+        "/alphanumeric \\- Gets a key like: `K9M2L7X4`\n\n"
         "🆓 Free users get 10 credits/day for your first 7 days\\.\n"
-        "💫 Subscribers get unlimited credits for 30 days\\."
+        "💫 Subscribers get unlimited credits for 30 days\\.\n"
+        "Credits are only spent by /numeric, /alphanumeric, and Regenerate — "
+        "saving, finding, deleting, and exporting are always free\\."
     )
 
 def build_welcome_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Open AuthKeys Web App", web_app=WebAppInfo(url=MINI_APP_URL))],
-        [InlineKeyboardButton("📋 Commands", callback_data="show_all_commands"), InlineKeyboardButton("🔒 Privacy", url=PRIVACY_POLICY_URL)]
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Open AuthKeys Web App", web_app=WebAppInfo(url=MINI_APP_URL))],
+            [
+                InlineKeyboardButton("📋 Commands", callback_data="show_all_commands"),
+                InlineKeyboardButton("🔒 Privacy Policy", url=PRIVACY_POLICY_URL),
+            ]
+        ]
+    )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(build_welcome_message(), parse_mode="MarkdownV2", reply_markup=build_welcome_keyboard())
+    await update.message.reply_text(
+        build_welcome_message(), parse_mode="MarkdownV2", reply_markup=build_welcome_keyboard()
+    )
 
 @rate_limit
 @credit_limit
 async def generate_numeric(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     key = generate_numeric_key()
-    sent = await update.message.reply_text(
-        f"🔑 Numeric Key: `{key}`",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate_numeric")]])
+    keyboard = [[InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate_numeric")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    sent_message = await update.message.reply_text(
+        f"🔑 Numeric Key: `{key}`", parse_mode="Markdown", reply_markup=reply_markup
     )
-    tag_generated_key(sent.chat_id, sent.message_id, key)
+    tag_generated_key(sent_message.chat_id, sent_message.message_id, key)
 
 @rate_limit
 @credit_limit
 async def generate_alphanumeric(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     key = generate_alphanumeric_key()
-    sent = await update.message.reply_text(
-        f"🔑 Alphanumeric Key: `{key}`",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate_alphanumeric")]])
+    keyboard = [[InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate_alphanumeric")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    sent_message = await update.message.reply_text(
+        f"🔑 Alphanumeric Key: `{key}`", parse_mode="Markdown", reply_markup=reply_markup
     )
-    tag_generated_key(sent.chat_id, sent.message_id, key)
+    tag_generated_key(sent_message.chat_id, sent_message.message_id, key)
 
 def full_commands_text() -> str:
     return (
@@ -554,26 +596,39 @@ def full_commands_text() -> str:
         "🔒 Privacy: saved details and keys are encrypted in the database."
     )
 
+# --- VERTICALLY STACKED /help BUTTONS ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_message = (
         "ℹ️ **AuthKeys Help & Support**\n\n"
-        "• Launch our interactive Dashboard or use the dedicated support options below:"
+        "• Encountered an error, glitch, or bug? Use /support to send a report.\n"
+        "• Have ideas, suggestions, or feature requests? Use /feedback.\n"
+        "• Issues regarding Telegram Stars purchases or refunds? Use /paysupport.\n\n"
+        "All data is zero-knowledge encrypted at rest."
     )
     keyboard = [
         [InlineKeyboardButton("🚀 Open AuthKeys Web App", web_app=WebAppInfo(url=MINI_APP_URL))],
-        [InlineKeyboardButton("🛠️ Report Issue (/support)", callback_data="btn_nav_support")],
+        [InlineKeyboardButton("🛠️️ Report Issue (/support)", callback_data="btn_nav_support")],
         [InlineKeyboardButton("💡 Give Feedback (/feedback)", callback_data="btn_nav_feedback")],
         [InlineKeyboardButton("💳 Payment Support (/paysupport)", callback_data="btn_nav_paysupport")],
     ]
-    await update.message.reply_text(help_message, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(help_message, parse_mode="Markdown", reply_markup=reply_markup)
 
 @rate_limit
 async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
     parts = text.split(" ", 2)
+
     if len(parts) < 3 or not parts[1].strip() or not parts[2].strip():
-        await update.message.reply_text("Usage: reply to a /numeric or /alphanumeric key message with:\n/save {title} {details}")
+        await update.message.reply_text(
+            "Usage: reply to a /numeric or /alphanumeric key message with:\n"
+            "/save {title} {details}\nExample: /save api1 my-important-key"
+        )
         return
+
+    title = parts[1].strip()
+    details = parts[2].strip()
+
     if not update.message.reply_to_message:
         await update.message.reply_text("⚠️ /save must be used as a reply to a generated key message.")
         return
@@ -587,64 +642,110 @@ async def save_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     user_id = update.effective_user.id
     saved_by_name = update.effective_user.full_name or "Unknown"
-    created_at = save_record(user_id, chat_id, saved_by_name, parts[1].strip(), parts[2].strip(), generated_key)
-    await update.message.reply_text(f"Saved '{parts[1].strip()}'.\nDetails: {parts[2].strip()}\n🔑 Generated Key: {generated_key}\nCreated: {created_at}")
+    created_at = save_record(user_id, chat_id, saved_by_name, title, details, generated_key)
+
+    key_line = f"\n🔑 Generated Key: {generated_key}" if generated_key else ""
+    await update.message.reply_text(f"Saved '{title}'.\nDetails: {details}{key_line}\nCreated: {created_at}")
+
+def build_find_response(title: str, details: str, generated_key: str | None, created_at: str, saved_by_name: str | None = None) -> str:
+    e = html.escape
+    generated_key_text = e(generated_key) if generated_key else "N/A"
+    saved_by_line = f"Saved by: {e(saved_by_name)}\n" if saved_by_name else ""
+    return (
+        f"Title: {e(title)}\n"
+        f"{saved_by_line}"
+        f"Details: {e(details)}\n"
+        f"Generated key: <code>{generated_key_text}</code>\n"
+        f"Saved: {e(created_at)}"
+    )
 
 @rate_limit
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
+    args = context.args
+    if not args:
         await update.message.reply_text("Usage: /find {title}\nExample: /find api1")
         return
-    title = context.args[0].strip()
-    team_mode = update.effective_chat.type in ("group", "supergroup") and is_sharing_enabled(update.effective_chat.id)
+
+    title = args[0].strip()
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    team_mode = chat_type in ("group", "supergroup") and is_sharing_enabled(chat_id)
+
     try:
-        record = find_record(update.effective_user.id, update.effective_chat.id, title, team_mode=team_mode)
+        record = find_record(user_id, chat_id, title, team_mode=team_mode)
     except DecryptionError:
         await update.message.reply_text(DECRYPT_FAIL_MESSAGE)
         return
     if not record:
         await update.message.reply_text(f"No saved entry found for title '{title}'.")
         return
+
     details, generated_key, created_at, saved_by_name = record
-    e = html.escape
-    key_txt = e(generated_key) if generated_key else "N/A"
-    saved_by_line = f"Saved by: {e(saved_by_name)}\n" if team_mode else ""
-    await update.message.reply_text(f"Title: {e(title)}\n{saved_by_line}Details: {e(details)}\nGenerated key: <code>{key_txt}</code>\nSaved: {e(created_at)}", parse_mode="HTML")
+    response = build_find_response(title, details, generated_key, created_at, saved_by_name=saved_by_name if team_mode else None)
+    await update.message.reply_text(response, parse_mode="HTML")
 
 @rate_limit
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /delete {title}")
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /delete {title}\nExample: /delete api1")
         return
-    if delete_record(update.effective_user.id, update.effective_chat.id, context.args[0].strip()):
-        await update.message.reply_text(f"Deleted '{context.args[0].strip()}'.")
+
+    title = args[0].strip()
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    deleted = delete_record(user_id, chat_id, title)
+
+    if deleted:
+        await update.message.reply_text(f"Deleted '{title}'.")
     else:
-        await update.message.reply_text(f"No entry found for '{context.args[0].strip()}'.")
+        await update.message.reply_text(f"No saved entry found for title '{title}'.")
 
 @rate_limit
 async def delete_all_my_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
-        [InlineKeyboardButton("⚠️ Yes, delete everything", callback_data="confirm_delete_all"), InlineKeyboardButton("Cancel", callback_data="cancel_delete_all")]
+        [
+            InlineKeyboardButton("⚠️ Yes, delete everything", callback_data="confirm_delete_all"),
+            InlineKeyboardButton("Cancel", callback_data="cancel_delete_all"),
+        ]
     ]
-    await update.message.reply_text("This will permanently delete ALL your saved entries. Are you sure?", reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "This will permanently delete ALL your saved entries. This cannot be undone.\n\nAre you sure?",
+        reply_markup=reply_markup,
+    )
 
 @rate_limit
 async def export_my_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    team_mode = update.effective_chat.type in ("group", "supergroup") and is_sharing_enabled(update.effective_chat.id)
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    team_mode = chat_type in ("group", "supergroup") and is_sharing_enabled(chat_id)
+
     try:
-        records = find_all_team_records(update.effective_chat.id) if team_mode else find_all_records(update.effective_user.id, update.effective_chat.id)
+        if team_mode:
+            records = find_all_team_records(chat_id)
+            header = "📦 This group's shared saved data:\n"
+        else:
+            records = find_all_records(user_id, chat_id)
+            header = "📦 Your saved data for this chat:\n"
     except DecryptionError:
         await update.message.reply_text(DECRYPT_FAIL_MESSAGE)
         return
+
     if not records:
         await update.message.reply_text("There's no saved data to export here.")
         return
-    lines = ["📦 Saved data:\n"]
+
+    lines = [header]
     for title, details, generated_key, created_at, saved_by_name in records:
         key_text = generated_key if generated_key else "N/A"
-        by_line = f"Saved by: {saved_by_name}\n" if team_mode else ""
-        lines.append(f"Title: {title}\n{by_line}Details: {details}\nGenerated key: {key_text}\nSaved: {created_at}\n")
-    await update.message.reply_text("\n".join(lines))
+        saved_by_line = f"Saved by: {saved_by_name}\n" if team_mode else ""
+        lines.append(f"Title: {title}\n{saved_by_line}Details: {details}\nGenerated key: {key_text}\nSaved: {created_at}\n")
+
+    export_text = "\n".join(lines)
+    await update.message.reply_text(export_text)
 
 @rate_limit
 async def team_sharing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -652,41 +753,72 @@ async def team_sharing_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text("Team sharing only applies inside group chats, not in DMs.")
         return
-    if not context.args or context.args[0].lower() not in ("on", "off"):
-        status = "ON ✅" if is_sharing_enabled(chat.id) else "OFF ❌"
-        await update.message.reply_text(f"Team key sharing is currently {status} for this group.\nUse /team_sharing on or off.")
+
+    args = context.args
+    if not args or args[0].lower() not in ("on", "off"):
+        current = is_sharing_enabled(chat.id)
+        status = "ON ✅" if current else "OFF ❌"
+        await update.message.reply_text(
+            f"Team key sharing is currently {status} for this group.\n\n"
+            "Use /team_sharing on or /team_sharing off to change it."
+        )
         return
-    member = await context.bot.get_chat_member(chat.id, update.effective_user.id)
-    if not member or member.status not in ("creator", "administrator"):
-        await update.message.reply_text("🔒 Only group admins can toggle team sharing.")
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, update.effective_user.id)
+    except Exception:
+        member = None
+    if member is None or member.status not in ("creator", "administrator"):
+        await update.message.reply_text("🔒 Only group admins can turn team sharing on or off.")
         return
-    enabled = context.args[0].lower() == "on"
+
+    enabled = args[0].lower() == "on"
     set_sharing_enabled(chat.id, enabled)
-    await update.message.reply_text(f"✅ Team sharing is now {'ON' if enabled else 'OFF'} for this group.")
+    if enabled:
+        await update.message.reply_text("✅ Team sharing is now ON for this group.")
+    else:
+        await update.message.reply_text("❌ Team sharing is now OFF for this group.")
 
 @rate_limit
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_row = get_or_create_user(update.effective_user.id)
-    role_badge = "\n👑 Role: Administrator (Verified)" if (ADMIN_USER_ID != 0 and update.effective_user.id == ADMIN_USER_ID) else ""
+    user_id = update.effective_user.id
+    user_row = get_or_create_user(user_id)
+
+    is_admin = (ADMIN_USER_ID != 0 and user_id == ADMIN_USER_ID)
+    role_badge = "\n👑 Role: Administrator (Verified)" if is_admin else ""
+
     if is_subscribed(user_row):
-        await update.message.reply_text(f"✅ Active subscription — unlimited credits until {user_row['subscription_expires']} UTC.{role_badge}")
+        await update.message.reply_text(
+            f"✅ Active subscription — unlimited credits until {user_row['subscription_expires']} UTC.{role_badge}"
+        )
         return
-    days_elapsed = (datetime.utcnow() - datetime.strptime(user_row["trial_start"], "%Y-%m-%d")).days
+
+    trial_start = datetime.strptime(user_row["trial_start"], "%Y-%m-%d")
+    days_elapsed = (datetime.utcnow() - trial_start).days
     days_left = max(0, TRIAL_PERIOD_DAYS - days_elapsed)
+
     if days_left == 0:
-        await update.message.reply_text(f"🚫 Your free trial has ended.\nSubscribe with /subscribe for unlimited credits.{role_badge}")
+        await update.message.reply_text(
+            f"🚫 Your free trial has ended.\nSubscribe with /subscribe for 30 days of unlimited credits.{role_badge}"
+        )
         return
-    rem = max(0, FREE_DAILY_CREDITS - get_today_credit_usage(update.effective_user.id))
-    await update.message.reply_text(f"🆓 Free trial: {days_left} day(s) left.\nCredits remaining today: {rem}\n{role_badge}")
+
+    used_today = get_today_credit_usage(user_id)
+    remaining_today = max(0, FREE_DAILY_CREDITS - used_today)
+    await update.message.reply_text(
+        f"🆓 Free trial: {days_left} day(s) left.\n"
+        f"Credits remaining today: {remaining_today}\n{role_badge}"
+    )
 
 @rate_limit
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
     await context.bot.send_invoice(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         title="AuthKeys Bot — 30 Day Subscription",
         description=f"Unlimited credits on AuthKeys Bot for {SUBSCRIPTION_DAYS} days.",
         payload=f"subscription_{update.effective_user.id}",
-        provider_token="",
+        provider_token="",  
         currency="XTR",
         prices=[LabeledPrice("30-day subscription", SUBSCRIPTION_PRICE_STARS)],
     )
@@ -696,20 +828,24 @@ def record_payment(user_id: int, charge_id: str, amount_stars: int, payload: str
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO payments (charge_id, user_id, amount_stars, payload, paid_at) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (charge_id) DO NOTHING",
+                "INSERT INTO payments (charge_id, user_id, amount_stars, payload, paid_at) "
+                "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (charge_id) DO NOTHING",
                 (charge_id, user_id, amount_stars, payload, paid_at),
             )
 
 @rate_limit
 async def paysupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = [[InlineKeyboardButton("💸 Request Refund", callback_data="req_refund_prompt")]]
+    keyboard = [
+        [InlineKeyboardButton("💸 Request Refund", callback_data="req_refund_prompt")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         "💳 **Payment & Subscription Support**\n\n"
         "Here you can manage issues with Telegram Stars transactions or request a refund for an active subscription.\n\n"
         "• To request a refund on an active payment, tap the button below.\n"
         "• For technical glitches or errors, please use the /support command.\n"
         "• For general thoughts or feature suggestions, use /feedback.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=reply_markup,
         parse_mode="Markdown"
     )
 
@@ -719,16 +855,20 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data.pop("awaiting_support", None)
     context.user_data.pop("awaiting_refund_reason", None)
     context.user_data.pop("admin_custom_reject_id", None)
+    
     keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_feedback")]]
-    await update.message.reply_text(
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    instruction = (
         "💡 **Feedback & Feature Suggestions**\n\n"
+        "We'd love to hear how you're using AuthKeys Bot and how we can make it even better!\n\n"
         "• **What you liked:** Which features worked well for your workflow?\n"
-        "• **What you hope to see:** Any new key formats or tools?\n\n"
-        "*(Note: For bug reports, please use /support instead.)*\n\n"
-        "✍️ *Type your feedback below and press Send:*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+        "• **What you hope to see:** Any new key formats, integrations, or tools you'd like added?\n"
+        "• **Ideas & Experience:** Any suggestions on how to improve the bot experience?\n\n"
+        "*(Note: If you are experiencing a technical bug, malfunction, or error, please use /support instead.)*\n\n"
+        "✍️ *Type your feedback below and press Send:*"
     )
+    await update.message.reply_text(instruction, reply_markup=reply_markup, parse_mode="Markdown")
 
 @rate_limit
 async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -736,17 +876,20 @@ async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data.pop("awaiting_feedback", None)
     context.user_data.pop("awaiting_refund_reason", None)
     context.user_data.pop("admin_custom_reject_id", None)
+
     keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_support")]]
-    await update.message.reply_text(
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    instruction = (
         "🛠️ **Technical Support & Bug Reporting**\n\n"
-        "• **1. What were you doing?**\n"
-        "• **2. What happened?**\n"
-        "• **3. What was expected?**\n\n"
-        "📷 You may attach a screenshot showing the defect. Text description is required.\n\n"
-        "✍️ *Type your issue details below and press Send:*",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+        "To help our engineering team resolve your issue as quickly as possible, please provide a clear and precise report:\n\n"
+        "• **1. What were you doing?** (e.g., Which command was run? Private chat or group?)\n"
+        "• **2. What happened?** (What error message or glitch appeared?)\n"
+        "• **3. What was expected?** (What should have occurred instead?)\n\n"
+        "📷 **Screenshots:** You can attach a screenshot showing the error, but please ensure your message includes a description in the text or photo caption.\n\n"
+        "✍️ *Type your issue details below and press Send:*"
     )
+    await update.message.reply_text(instruction, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.pre_checkout_query
@@ -760,11 +903,14 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     payment = update.message.successful_payment
     record_payment(user_id, payment.telegram_payment_charge_id, payment.total_amount, payment.invoice_payload)
     new_expiry = grant_subscription(user_id, days=SUBSCRIPTION_DAYS)
-    await update.message.reply_text(f"✅ Payment received! Unlimited credits active until {new_expiry} UTC.")
+    await update.message.reply_text(
+        f"✅ Payment received! You now have unlimited credits until {new_expiry} UTC."
+    )
 
 async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     num_key = generate_numeric_key()
     alpha_key = generate_alphanumeric_key()
+
     results = [
         InlineQueryResultArticle(
             id=str(uuid.uuid4()),
@@ -804,6 +950,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if wait is not None:
             await query.answer(f"⏳ Please wait {wait}s before trying again.", show_alert=True)
             return
+
         allowed, reason = check_credit_allowed(user_id)
         if not allowed:
             await query.answer(reason, show_alert=True)
@@ -813,12 +960,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if query.data == "regenerate_numeric":
         key = generate_numeric_key()
-        await query.edit_message_text(f"🔑 Numeric Key: `{key}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate_numeric")]]))
+        keyboard = [[InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate_numeric")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(f"🔑 Numeric Key: `{key}`", parse_mode="Markdown", reply_markup=reply_markup)
         tag_generated_key(query.message.chat_id, query.message.message_id, key)
 
     elif query.data == "regenerate_alphanumeric":
         key = generate_alphanumeric_key()
-        await query.edit_message_text(f"🔑 Alphanumeric Key: `{key}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate_alphanumeric")]]))
+        keyboard = [[InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate_alphanumeric")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(f"🔑 Alphanumeric Key: `{key}`", parse_mode="Markdown", reply_markup=reply_markup)
         tag_generated_key(query.message.chat_id, query.message.message_id, key)
 
     elif query.data == "confirm_delete_all":
@@ -829,7 +980,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("Cancelled. Your data was not deleted.")
 
     elif query.data == "show_all_commands":
-        await query.edit_message_text(full_commands_text(), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="back_to_welcome")]]))
+        back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="back_to_welcome")]])
+        await query.edit_message_text(full_commands_text(), reply_markup=back_keyboard)
 
     elif query.data == "back_to_welcome":
         await query.edit_message_text(build_welcome_message(), parse_mode="MarkdownV2", reply_markup=build_welcome_keyboard())
@@ -837,25 +989,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif query.data == "btn_nav_support":
         context.user_data["awaiting_support"] = True
         context.user_data.pop("awaiting_feedback", None)
-        await query.edit_message_text(
-            "🛠️ **Technical Support & Bug Reporting**\n\n• Explain the issue and what you expected.\n📷 Screenshots welcome.\n\n✍️ *Type your message below:*",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_support")]]),
-            parse_mode="Markdown"
+        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_support")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        instruction = (
+            "🛠️ **Technical Support & Bug Reporting**\n\n"
+            "• **1. What were you doing?**\n"
+            "• **2. What happened?**\n"
+            "• **3. What was expected?**\n\n"
+            "📷 You may attach a screenshot showing the defect. Text description is required.\n\n"
+            "✍️ *Type your issue details below and send:*"
         )
+        await query.edit_message_text(instruction, reply_markup=reply_markup, parse_mode="Markdown")
 
     elif query.data == "btn_nav_feedback":
         context.user_data["awaiting_feedback"] = True
         context.user_data.pop("awaiting_support", None)
-        await query.edit_message_text(
-            "💡 **Feedback & Feature Suggestions**\n\n• What did you like? What features would you like to see?\n\n✍️ *Type your feedback below:*",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_feedback")]]),
-            parse_mode="Markdown"
+        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_feedback")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        instruction = (
+            "💡 **Feedback & Feature Suggestions**\n\n"
+            "• Share what features worked well for you.\n"
+            "• Suggest new features or improvements.\n\n"
+            "✍️ *Type your feedback below and send:*"
         )
+        await query.edit_message_text(instruction, reply_markup=reply_markup, parse_mode="Markdown")
 
     elif query.data == "btn_nav_paysupport":
+        keyboard = [
+            [InlineKeyboardButton("💸 Request Refund", callback_data="req_refund_prompt")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            "💳 **Payment Support**\nManage Stars transactions or request a refund:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💸 Request Refund", callback_data="req_refund_prompt")]]),
+            "💳 **Payment & Subscription Support**\n\n"
+            "Here you can manage issues with Telegram Stars transactions or request a refund for an active subscription.\n\n"
+            "• To request a refund on an active payment, tap the button below.\n"
+            "• For technical glitches or errors, please use the /support command.\n"
+            "• For general thoughts or feature suggestions, use /feedback.",
+            reply_markup=reply_markup,
             parse_mode="Markdown"
         )
 
@@ -869,39 +1039,59 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif query.data == "cancel_admin_rejection":
         context.user_data.pop("admin_custom_reject_id", None)
-        await query.edit_message_text("Dismissal cancelled. Refund remains pending.")
+        await query.edit_message_text("Dismissal action cancelled. Refund remains pending in queue.")
 
     elif query.data == "req_refund_prompt":
-        terms_message = (
-            "⚠️ **Refund Policy Terms**\n\n"
-            "• Reviews take 3 to 5 business days.\n"
-            "• Must demonstrate technical defect or malfunction.\n\nProceed?"
-        )
         warning_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, continue", callback_data="user_confirm_refund"), InlineKeyboardButton("❌ Cancel", callback_data="user_cancel_refund")]
+            [
+                InlineKeyboardButton("✅ Yes, continue", callback_data="user_confirm_refund"),
+                InlineKeyboardButton("❌ No, cancel", callback_data="user_cancel_refund"),
+            ]
         ])
+        terms_message = (
+            "⚠ **Important Refund Policy Terms**\n\n"
+            "Please review our policy conditions carefully before submitting:\n\n"
+            "• All refund requests are individually reviewed within **3 to 5 working days**.\n"
+            "• A refund is **not automatic** and cannot be granted simply upon request.\n"
+            "• You **must provide a valid, verifiable reason** or report a system defect explaining why you are unsatisfied.\n"
+            "• If approved, your active subscription is revoked immediately and Stars are credited back to your balance.\n\n"
+            "Do you wish to proceed?"
+        )
         await query.edit_message_text(terms_message, reply_markup=warning_kb, parse_mode="Markdown")
 
     elif query.data == "user_cancel_refund":
         context.user_data.pop("awaiting_refund_reason", None)
-        await query.edit_message_text("Refund request cancelled.")
+        await query.edit_message_text("Refund request cancelled. Your subscription remains active.")
 
     elif query.data == "user_confirm_refund":
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("SELECT charge_id, amount_stars, paid_at FROM payments WHERE user_id = %s ORDER BY paid_at DESC LIMIT 1", (user_id,))
+                cursor.execute(
+                    "SELECT charge_id, amount_stars, paid_at FROM payments WHERE user_id = %s ORDER BY paid_at DESC LIMIT 1",
+                    (user_id,)
+                )
                 payment_record = cursor.fetchone()
+
         if not payment_record:
-            await query.edit_message_text("⚠️ No payment record found for your account.")
+            await query.edit_message_text("⚠️ No payment record found for your account to refund.")
             return
+
         context.user_data["awaiting_refund_reason"] = True
         context.user_data.pop("awaiting_feedback", None)
         context.user_data.pop("awaiting_support", None)
-        await query.edit_message_text(
-            "✍️ **Provide Your Refund Reason**\n\nDetail the issue encountered (Screenshots welcome):\n\nType your message now:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Request", callback_data="user_cancel_refund")]]),
-            parse_mode="Markdown"
+
+        keyboard = [[InlineKeyboardButton("❌ Cancel Request", callback_data="user_cancel_refund")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        instruction = (
+            "✍️ **Provide Your Refund Reason**\n\n"
+            "Please write a message explaining why you are requesting a refund:\n"
+            "• Detail the issue or defect encountered.\n"
+            "• **Text is required.**\n"
+            "• You may attach a screenshot/photo if it illustrates an error.\n\n"
+            "Type your reason now and send it:"
         )
+        await query.edit_message_text(instruction, reply_markup=reply_markup, parse_mode="Markdown")
 
     # --- ADMIN QUEUE INSPECTION CALLBACKS ---
     elif query.data == "adm_view_refunds":
@@ -926,53 +1116,96 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if user_id != ADMIN_USER_ID:
             await query.answer("⛔ Unauthorized.", show_alert=True)
             return
-        await display_refund_card(query.message, int(query.data.split("_")[-1]), context)
+        req_id = int(query.data.split("_")[-1])
+        await display_refund_card(query.message, req_id, context)
 
+    # --- ADMIN APPROVAL TWO-STEP CONFIRMATION ---
     elif query.data.startswith("adm_warn_rf_"):
         if user_id != ADMIN_USER_ID:
             await query.answer("⛔ Unauthorized.", show_alert=True)
             return
+
         req_id = int(query.data.split("_")[-1])
         confirm_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚠️ Confirm & Issue Refund", callback_data=f"adm_exec_rf_{req_id}"), InlineKeyboardButton("Cancel", callback_data="adm_view_refunds")]
+            [
+                InlineKeyboardButton("⚠️ Confirm & Issue Refund", callback_data=f"adm_exec_rf_{req_id}"),
+                InlineKeyboardButton("Cancel", callback_data="adm_view_refunds")
+            ]
         ])
-        await query.edit_message_text(f"⚠️ Confirm executing refund `#{req_id}`?", reply_markup=confirm_kb, parse_mode="Markdown")
+        await query.edit_message_text(
+            f"⚠️ **ADMIN SAFETY CONFIRMATION**\n\n"
+            f"Are you sure you want to approve and execute refund request `#{req_id}`?\n"
+            "Telegram will immediately refund the Stars to the buyer's balance.",
+            reply_markup=confirm_kb,
+            parse_mode="Markdown"
+        )
 
+    # --- ADMIN EXECUTE REFUND ---
     elif query.data.startswith("adm_exec_rf_"):
         if user_id != ADMIN_USER_ID:
             await query.answer("⛔ Unauthorized.", show_alert=True)
             return
+
         req_id = int(query.data.split("_")[-1])
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("SELECT user_id, user_name, username, charge_id, amount_stars FROM refund_requests WHERE id = %s", (req_id,))
+                cursor.execute(
+                    "SELECT user_id, user_name, username, charge_id, amount_stars FROM refund_requests WHERE id = %s",
+                    (req_id,)
+                )
                 row = cursor.fetchone()
+
         if not row:
-            await query.edit_message_text("❌ Request not found.")
+            await query.edit_message_text("❌ Request record not found.")
             return
+
         target_uid, uname, u_handle, target_charge, amount = row
+        handle_part = f" (@{u_handle})" if u_handle and u_handle != "None" else ""
+
         if str(target_charge).startswith("TEST_"):
             with get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("UPDATE refund_requests SET status = 'approved' WHERE id = %s", (req_id,))
-            await query.edit_message_text(f"✅ **[TEST PASS] Mock Refund Approved!**\n\nID: `#{req_id}`\nAmount: {amount} Stars", parse_mode="Markdown")
+            await query.edit_message_text(
+                f"✅ **[TEST PASS] Mock Refund Approved!**\n\n"
+                f"• Request ID: `#{req_id}`\n"
+                f"• Target User: {uname}{handle_part} (`{target_uid}`)\n"
+                f"• Amount: {amount} Stars\n"
+                "Simulated refund executed successfully.",
+                parse_mode="Markdown"
+            )
             return
+
         try:
-            await context.bot.refund_star_payment(user_id=target_uid, telegram_payment_charge_id=target_charge)
+            await context.bot.refund_star_payment(
+                user_id=target_uid,
+                telegram_payment_charge_id=target_charge
+            )
+
             with get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("UPDATE refund_requests SET status = 'approved' WHERE id = %s", (req_id,))
                     cursor.execute("UPDATE users SET subscription_expires = NULL WHERE user_id = %s", (target_uid,))
                     cursor.execute("DELETE FROM payments WHERE charge_id = %s", (target_charge,))
-            await query.edit_message_text(f"✅ Refund executed for `#{req_id}`.")
+
+            await query.edit_message_text(
+                f"✅ **Refund Executed**\n\nRequest `#{req_id}` completed. {amount} Stars returned to {uname}{handle_part} (`{target_uid}`).",
+                parse_mode="Markdown"
+            )
+
             if target_uid != ADMIN_USER_ID:
                 try:
-                    await context.bot.send_message(chat_id=target_uid, text="✅ Your refund request has been approved. Your Stars have been refunded.")
+                    await context.bot.send_message(
+                        chat_id=target_uid,
+                        text="✅ Your refund request has been approved. Your Stars have been returned to your balance."
+                    )
                 except Exception:
                     pass
+
         except Exception as exc:
             await query.edit_message_text(f"❌ Telegram Refund Error: {exc}")
 
+    # --- ADMIN DISMISS MENU ---
     elif query.data.startswith("adm_dismiss_menu_"):
         if user_id != ADMIN_USER_ID:
             await query.answer("⛔ Unauthorized.", show_alert=True)
@@ -983,45 +1216,86 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             [InlineKeyboardButton("✍️ Dismiss with Custom Reason", callback_data=f"adm_custom_dismiss_prompt_{req_id}")],
             [InlineKeyboardButton("⬅ Back to Request", callback_data=f"adm_rf_item_{req_id}")]
         ])
-        await query.edit_message_text(f"❌ **Dismiss Refund Request: #{req_id}**\n\nChoose rejection notification mode:", reply_markup=dismiss_kb, parse_mode="Markdown")
+        await query.edit_message_text(
+            f"❌ **Dismiss Refund Request: #{req_id}**\n\n"
+            "Choose how you want to notify the user of this rejection:\n\n"
+            "• **Fast Dismiss:** Automatically notifies the user with our standard corporate policy template.\n"
+            "• **Custom Reason:** Prompts you to type a personal explanation which will be sent to the user.",
+            reply_markup=dismiss_kb,
+            parse_mode="Markdown"
+        )
 
+    # --- ADMIN FAST CORPORATE DISMISS ---
     elif query.data.startswith("adm_fast_dismiss_"):
         if user_id != ADMIN_USER_ID:
             await query.answer("⛔ Unauthorized.", show_alert=True)
             return
-        req_id = int(query.data.split("_")[-1])
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("UPDATE refund_requests SET status = 'rejected', admin_notes = 'Corporate rejection sent.' WHERE id = %s RETURNING user_id, user_name, username", (req_id,))
-                res = cursor.fetchone()
-        if not res:
-            await query.edit_message_text("❌ Request not found.")
-            return
-        target_uid, uname, u_handle = res
-        if target_uid != ADMIN_USER_ID:
-            try:
-                await context.bot.send_message(chat_id=target_uid, text=build_corporate_rejection(uname, u_handle), parse_mode="HTML")
-            except Exception:
-                pass
-        await query.edit_message_text(f"✅ Refund Request `#{req_id}` dismissed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Back to Queue", callback_data="adm_view_refunds")]]))
 
+        req_id = int(query.data.split("_")[-1])
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE refund_requests SET status = 'rejected', admin_notes = 'Default corporate rejection sent.' WHERE id = %s RETURNING user_id, user_name, username",
+                        (req_id,)
+                    )
+                    res = cursor.fetchone()
+
+            if not res:
+                await query.edit_message_text("❌ Request not found.")
+                return
+
+            target_uid, uname, u_handle = res
+            handle_part = f" (@{u_handle})" if u_handle and u_handle != "None" else ""
+
+            if target_uid != ADMIN_USER_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=target_uid,
+                        text=build_corporate_rejection(uname, u_handle),
+                        parse_mode="HTML"
+                    )
+                    notify_status = f"Customer {uname}{handle_part} notified via standard policy notice."
+                except Exception as e:
+                    logger.warning(f"Could not deliver notice to user: {e}")
+                    notify_status = f"Could not notify {uname}{handle_part} (chat might be blocked)."
+            else:
+                notify_status = f"[TEST MODE] Customer notification simulated for {uname}{handle_part}."
+
+            back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Back to Queue", callback_data="adm_view_refunds")]])
+            await query.edit_message_text(
+                f"✅ **Refund Request #{req_id} Dismissed**\n\n{notify_status}",
+                reply_markup=back_kb,
+                parse_mode="Markdown"
+            )
+        except Exception as exc:
+            logger.error("Error in fast dismiss", exc_info=exc)
+            await query.edit_message_text(f"❌ Error processing dismissal: {exc}")
+
+    # --- ADMIN CUSTOM REASON PROMPT ---
     elif query.data.startswith("adm_custom_dismiss_prompt_"):
         if user_id != ADMIN_USER_ID:
             await query.answer("⛔ Unauthorized.", show_alert=True)
             return
+
         req_id = int(query.data.split("_")[-1])
         context.user_data["admin_custom_reject_id"] = req_id
+        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Action", callback_data="cancel_admin_rejection")]])
         await query.edit_message_text(
-            f"✍️ **Custom Rejection Note for #{req_id}**\n\nType the rejection reason below and send:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_admin_rejection")]]),
+            f"✍️ **Custom Rejection Note for Request #{req_id}**\n\n"
+            "Please type out the reason for rejecting this refund request below and press Send.\n\n"
+            "The bot will wrap your explanation into an official notice and dispatch it directly to the user.",
+            reply_markup=cancel_kb,
             parse_mode="Markdown"
         )
 
+    # --- ADMIN FEEDBACK HANDLERS ---
     elif query.data.startswith("adm_fb_item_"):
         if user_id != ADMIN_USER_ID:
             await query.answer("⛔ Unauthorized.", show_alert=True)
             return
-        await display_feedback_card(query.message, int(query.data.split("_")[-1]), context)
+        fb_id = int(query.data.split("_")[-1])
+        await display_feedback_card(query.message, fb_id, context)
 
     elif query.data.startswith("adm_fb_dismiss_"):
         if user_id != ADMIN_USER_ID:
@@ -1031,17 +1305,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("UPDATE feedback_reports SET status = 'reviewed' WHERE id = %s", (fb_id,))
-        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Queue", callback_data="adm_view_feedbacks")]])
-        if query.message.photo:
-            await query.message.edit_caption(caption=f"✅ Feedback report `#{fb_id}` marked reviewed.", reply_markup=back_kb)
-        else:
-            await query.message.edit_text(f"✅ Feedback report `#{fb_id}` marked reviewed.", reply_markup=back_kb)
 
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Queue", callback_data="adm_view_feedbacks")]])
+        update_text = f"✅ **Review Completed**\n\nFeedback report `#{fb_id}` marked as reviewed."
+
+        if query.message.photo:
+            await query.message.edit_caption(caption=update_text, reply_markup=back_kb, parse_mode="Markdown")
+        else:
+            await query.message.edit_text(text=update_text, reply_markup=back_kb, parse_mode="Markdown")
+
+    # --- ADMIN SUPPORT TICKETS HANDLERS ---
     elif query.data.startswith("adm_sp_item_"):
         if user_id != ADMIN_USER_ID:
             await query.answer("⛔ Unauthorized.", show_alert=True)
             return
-        await display_support_card(query.message, int(query.data.split("_")[-1]), context)
+        ticket_id = int(query.data.split("_")[-1])
+        await display_support_card(query.message, ticket_id, context)
 
     elif query.data.startswith("adm_sp_dismiss_"):
         if user_id != ADMIN_USER_ID:
@@ -1051,31 +1330,69 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("UPDATE support_tickets SET status = 'resolved' WHERE id = %s", (ticket_id,))
-        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Tickets", callback_data="adm_view_support")]])
-        if query.message.photo:
-            await query.message.edit_caption(caption=f"✅ Ticket `#{ticket_id}` marked resolved.", reply_markup=back_kb)
-        else:
-            await query.message.edit_text(f"✅ Ticket `#{ticket_id}` marked resolved.", reply_markup=back_kb)
 
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to Tickets", callback_data="adm_view_support")]])
+        update_text = f"✅ **Issue Resolved**\n\nSupport ticket `#{ticket_id}` marked as resolved."
+
+        if query.message.photo:
+            await query.message.edit_caption(caption=update_text, reply_markup=back_kb, parse_mode="Markdown")
+        else:
+            await query.message.edit_text(text=update_text, reply_markup=back_kb, parse_mode="Markdown")
+
+# --- INCOMING SUBMISSION HANDLER ---
 async def handle_user_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     user_id = user.id
 
+    # 1. HANDLE ADMIN TYPING A CUSTOM REJECTION REASON
     if user_id == ADMIN_USER_ID and "admin_custom_reject_id" in context.user_data:
         req_id = context.user_data.pop("admin_custom_reject_id")
-        custom_reason = (update.message.caption if update.message.photo else update.message.text) or "[No reason provided]"
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("UPDATE refund_requests SET status = 'rejected', admin_notes = %s WHERE id = %s RETURNING user_id, user_name, username", (custom_reason, req_id))
-                row = cursor.fetchone()
-        if row and row[0] != ADMIN_USER_ID:
-            try:
-                await context.bot.send_message(chat_id=row[0], text=build_custom_rejection(row[1], row[2], custom_reason), parse_mode="HTML")
-            except Exception:
-                pass
-        await update.message.reply_text(f"✅ Refund Request `#{req_id}` dismissed with custom reason.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Back to Queue", callback_data="adm_view_refunds")]]))
+        
+        custom_reason = update.message.caption if update.message.photo else update.message.text
+        custom_reason = custom_reason.strip() if custom_reason else "[No specific explanation provided]"
+
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE refund_requests SET status = 'rejected', admin_notes = %s WHERE id = %s RETURNING user_id, user_name, username",
+                        (custom_reason, req_id)
+                    )
+                    row = cursor.fetchone()
+
+            if not row:
+                await update.message.reply_text("❌ Could not locate that refund request in the database.")
+                return
+
+            target_uid, uname, u_handle = row
+            handle_part = f" (@{u_handle})" if u_handle and u_handle != "None" else ""
+
+            if target_uid != ADMIN_USER_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=target_uid,
+                        text=build_custom_rejection(uname, u_handle, custom_reason),
+                        parse_mode="HTML"
+                    )
+                    delivery_status = f"Customer {uname}{handle_part} has been notified with your reason."
+                except Exception as e:
+                    logger.warning(f"Could not deliver custom rejection to user: {e}")
+                    delivery_status = f"Could not notify {uname}{handle_part} (chat may be blocked)."
+            else:
+                delivery_status = f"[TEST MODE] Customer notification simulated for {uname}{handle_part}."
+
+            back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Back to Queue", callback_data="adm_view_refunds")]])
+            await update.message.reply_text(
+                f"✅ **Refund Request #{req_id} Dismissed**\n\n{delivery_status}\n\n**Reason Stored:**\n<i>\"{html.escape(custom_reason)}\"</i>",
+                reply_markup=back_kb,
+                parse_mode="HTML"
+            )
+        except Exception as exc:
+            logger.error("Error executing custom rejection", exc_info=exc)
+            await update.message.reply_text(f"❌ Error updating refund request: {exc}")
         return
 
+    # Check for normal user input states
     is_feedback = context.user_data.get("awaiting_feedback", False)
     is_support = context.user_data.get("awaiting_support", False)
     is_refund = context.user_data.get("awaiting_refund_reason", False)
@@ -1086,96 +1403,223 @@ async def handle_user_submission(update: Update, context: ContextTypes.DEFAULT_T
     text_content = update.message.caption if update.message.photo else update.message.text
     photo_file_id = update.message.photo[-1].file_id if update.message.photo else None
 
+    # ENFORCE TEXT REQUIREMENT
     if not text_content or not text_content.strip():
-        await update.message.reply_text("⚠️ A written explanation is required.")
+        await update.message.reply_text(
+            "⚠️ **A written explanation is required.**\n\n"
+            "Submitting a photo alone is not sufficient. Please send your message again with a description (or add it as a photo caption).",
+            parse_mode="Markdown"
+        )
         return
 
     user_name = user.full_name or "Anonymous"
     username_str = user.username or "None"
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    # 2. PROCESS USER REFUND REASON SUBMISSION
     if is_refund:
         context.user_data.pop("awaiting_refund_reason", None)
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT charge_id, amount_stars FROM payments WHERE user_id = %s ORDER BY paid_at DESC LIMIT 1", (user_id,))
-                payment_record = cursor.fetchone()
-        if not payment_record:
-            await update.message.reply_text("⚠️ No payment record found.")
-            return
+
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "INSERT INTO refund_requests (user_id, user_name, username, charge_id, amount_stars, reason, photo_file_id, status, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)",
-                    (user_id, user_name, username_str, payment_record[0], payment_record[1], text_content.strip(), photo_file_id, timestamp)
+                    "SELECT charge_id, amount_stars FROM payments WHERE user_id = %s ORDER BY paid_at DESC LIMIT 1",
+                    (user_id,)
                 )
-        await update.message.reply_text("✅ Refund Request submitted for review.")
+                payment_record = cursor.fetchone()
+
+        if not payment_record:
+            await update.message.reply_text("⚠️ No payment record found for your account.")
+            return
+
+        charge_id, amount_stars = payment_record
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO refund_requests 
+                    (user_id, user_name, username, charge_id, amount_stars, reason, photo_file_id, status, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)
+                    """,
+                    (user_id, user_name, username_str, charge_id, amount_stars, text_content.strip(), photo_file_id, timestamp)
+                )
+
+        await update.message.reply_text(
+            "✅ **Refund Request Submitted**\n\n"
+            "Your request has been logged into our administration queue.\n\n"
+            "• Reviews are processed within **3 to 5 working days**.\n"
+            "• You will receive a direct notification once the review is completed.",
+            parse_mode="Markdown"
+        )
+
         if ADMIN_USER_ID:
-            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"🚨 New Refund Request from {user_name} ({payment_record[1]} Stars). Use /admin_refunds.")
+            pending_count = get_pending_refund_count()
+            admin_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"📋 View Pending Refunds ({pending_count})", callback_data="adm_view_refunds")]
+            ])
+            await context.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    f"🚨 **New Refund Request Received!**\n\n"
+                    f"• **Queue Status:** {pending_count} pending refund request(s)\n"
+                    f"• **Latest From:** {html.escape(user_name)} (`{user_id}`)\n"
+                    f"• **Amount:** {amount_stars} Stars\n\n"
+                    "Use the button below or type `/admin_refunds` to review."
+                ),
+                reply_markup=admin_kb,
+                parse_mode="Markdown"
+            )
         return
 
+    # 3. PROCESS USER FEEDBACK SUBMISSION
     if is_feedback:
         context.user_data.pop("awaiting_feedback", None)
+
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "INSERT INTO feedback_reports (user_id, user_name, username, feedback_text, photo_file_id, status, created_at) VALUES (%s, %s, %s, %s, %s, 'pending', %s)",
+                    """
+                    INSERT INTO feedback_reports 
+                    (user_id, user_name, username, feedback_text, photo_file_id, status, created_at)
+                    VALUES (%s, %s, %s, %s, %s, 'pending', %s)
+                    """,
                     (user_id, user_name, username_str, text_content.strip(), photo_file_id, timestamp)
                 )
-        await update.message.reply_text("🙏 Thank you! Your feedback has been received.")
+
+        await update.message.reply_text(
+            "🙏 **Thank you!** Your feedback and feature ideas have been forwarded to the developer team.",
+            parse_mode="Markdown"
+        )
+
         if ADMIN_USER_ID:
-            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"💡 New Feedback from {user_name}. Use /admin_feedbacks.")
+            pending_count = get_pending_feedback_count()
+            admin_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"📬 View Feedback ({pending_count})", callback_data="adm_view_feedbacks")]
+            ])
+            await context.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    f"💡 **New Feedback / Feature Idea Received!**\n\n"
+                    f"• **Queue Status:** {pending_count} pending feedback report(s)\n"
+                    f"• **From:** {html.escape(user_name)} (`{user_id}`)\n\n"
+                    "Use the button below or type `/admin_feedbacks` to review."
+                ),
+                reply_markup=admin_kb,
+                parse_mode="Markdown"
+            )
         return
 
+    # 4. PROCESS TECHNICAL SUPPORT TICKET SUBMISSION
     if is_support:
         context.user_data.pop("awaiting_support", None)
+
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "INSERT INTO support_tickets (user_id, user_name, username, issue_text, photo_file_id, status, created_at) VALUES (%s, %s, %s, %s, %s, 'pending', %s)",
+                    """
+                    INSERT INTO support_tickets 
+                    (user_id, user_name, username, issue_text, photo_file_id, status, created_at)
+                    VALUES (%s, %s, %s, %s, %s, 'pending', %s)
+                    """,
                     (user_id, user_name, username_str, text_content.strip(), photo_file_id, timestamp)
                 )
-        await update.message.reply_text("🛠️ Support Ticket logged. Our team is investigating.")
-        if ADMIN_USER_ID:
-            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"⚠️ New Support Ticket from {user_name}. Use /admin_support.")
 
+        await update.message.reply_text(
+            "🛠️ **Support Ticket Received!**\n\n"
+            "Your technical report has been forwarded to our engineering queue for investigation. Thank you for reporting this issue!",
+            parse_mode="Markdown"
+        )
+
+        if ADMIN_USER_ID:
+            pending_count = get_pending_support_count()
+            admin_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🛠️ View Support Tickets ({pending_count})", callback_data="adm_view_support")]
+            ])
+            await context.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    f"⚠️ **New Bug / Technical Support Ticket!**\n\n"
+                    f"• **Queue Status:** {pending_count} pending support ticket(s)\n"
+                    f"• **From:** {html.escape(user_name)} (`{user_id}`)\n\n"
+                    "Use the button below or type `/admin_support` to review."
+                ),
+                reply_markup=admin_kb,
+                parse_mode="Markdown"
+            )
+
+# --- ADMIN DISPLAY UTILITIES ---
 async def show_admin_refunds_menu(message, context: ContextTypes.DEFAULT_TYPE, is_edit=False) -> None:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, user_name, amount_stars, created_at FROM refund_requests WHERE status = 'pending' ORDER BY id DESC LIMIT 10")
+            cursor.execute(
+                "SELECT id, user_name, amount_stars, created_at FROM refund_requests WHERE status = 'pending' ORDER BY id DESC LIMIT 10"
+            )
             rows = cursor.fetchall()
+
     if not rows:
-        text = "✅ **No Pending Refunds**"
+        text = "✅ **No Pending Refunds**\n\nThe refund review queue is empty."
         if is_edit and message.text:
             await message.edit_text(text, parse_mode="Markdown")
         else:
             await message.reply_text(text, parse_mode="Markdown")
         return
-    keyboard = [[InlineKeyboardButton(f"#{r[0]}: {r[1][:12]} ({r[2]} Stars)", callback_data=f"adm_rf_item_{r[0]}")] for r in rows]
-    text = f"📋 **Pending Refund Queue ({len(rows)})**"
+
+    keyboard = []
+    for req_id, user_name, amount, created_at in rows:
+        btn_text = f"#{req_id}: {user_name[:12]} ({amount} Stars)"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"adm_rf_item_{req_id}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = f"📋 **Pending Refund Queue ({len(rows)})**\nSelect any request to inspect details and take action:"
     if is_edit and message.text:
-        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
-        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def display_refund_card(message, req_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT user_id, user_name, username, charge_id, amount_stars, reason, photo_file_id, created_at FROM refund_requests WHERE id = %s", (req_id,))
+            cursor.execute(
+                "SELECT user_id, user_name, username, charge_id, amount_stars, reason, photo_file_id, created_at FROM refund_requests WHERE id = %s",
+                (req_id,)
+            )
             row = cursor.fetchone()
+
     if not row:
         await message.reply_text("Request not found.")
         return
+
     uid, uname, u_handle, charge, amount, reason, photo_id, dt = row
-    card = f"📄 **Refund Request Details: #{req_id}**\n\n• **User:** {html.escape(uname)} (@{u_handle})\n• **User ID:** `{uid}`\n• **Amount:** {amount} Stars\n• **Charge:** `{charge}`\n• **Date:** {dt}\n\n**Reason:**\n{html.escape(reason)}"
+    card = (
+        f"📄 **Refund Request Details: #{req_id}**\n\n"
+        f"• **User:** {html.escape(uname)} (@{u_handle})\n"
+        f"• **User ID:** `{uid}`\n"
+        f"• **Amount:** {amount} Stars\n"
+        f"• **Charge ID:** `{charge}`\n"
+        f"• **Date:** {dt}\n\n"
+        f"**Reason:**\n{html.escape(reason)}"
+    )
+
     kb = [
-        [InlineKeyboardButton("💸 Approve Refund", callback_data=f"adm_warn_rf_{req_id}"), InlineKeyboardButton("❌ Reject / Dismiss...", callback_data=f"adm_dismiss_menu_{req_id}")],
+        [
+            InlineKeyboardButton("💸 Approve Refund", callback_data=f"adm_warn_rf_{req_id}"),
+            InlineKeyboardButton("❌ Reject / Dismiss...", callback_data=f"adm_dismiss_menu_{req_id}")
+        ],
         [InlineKeyboardButton("⬅ Back to Queue", callback_data="adm_view_refunds")]
     ]
+    reply_markup = InlineKeyboardMarkup(kb)
+
     if photo_id:
-        await context.bot.send_photo(chat_id=message.chat_id, photo=photo_id, caption=card, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await context.bot.send_photo(
+            chat_id=message.chat_id,
+            photo=photo_id,
+            caption=card,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
     else:
-        await message.reply_text(card, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await message.reply_text(card, reply_markup=reply_markup, parse_mode="Markdown")
 
 @rate_limit
 async def admin_refunds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1187,37 +1631,81 @@ async def admin_refunds_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def show_admin_feedback_menu(message, context: ContextTypes.DEFAULT_TYPE, is_edit=False) -> None:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, user_name, created_at FROM feedback_reports WHERE status = 'pending' ORDER BY id DESC LIMIT 10")
+            cursor.execute(
+                "SELECT id, user_name, created_at FROM feedback_reports WHERE status = 'pending' ORDER BY id DESC LIMIT 10"
+            )
             rows = cursor.fetchall()
+
+    empty_text = "✅ **No Pending Feedback**\n\nAll feedback reports have been reviewed."
+
     if not rows:
-        empty = "✅ **No Pending Feedback**"
-        if is_edit and message.text:
-            await message.edit_text(empty, parse_mode="Markdown")
+        if is_edit:
+            if message.photo:
+                await message.edit_caption(caption=empty_text, parse_mode="Markdown")
+            else:
+                await message.edit_text(empty_text, parse_mode="Markdown")
         else:
-            await message.reply_text(empty, parse_mode="Markdown")
+            await message.reply_text(empty_text, parse_mode="Markdown")
         return
-    keyboard = [[InlineKeyboardButton(f"#{r[0]}: {r[1][:15]}", callback_data=f"adm_fb_item_{r[0]}")] for r in rows]
-    text = f"📬 **Pending Feedback ({len(rows)})**"
-    if is_edit and message.text:
-        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    keyboard = []
+    for fb_id, user_name, created_at in rows:
+        btn_text = f"#{fb_id}: {user_name[:15]}"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"adm_fb_item_{fb_id}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    menu_text = f"📬 **Pending Feedback Ideas ({len(rows)})**\nSelect any report to review:"
+
+    if is_edit:
+        if message.photo:
+            await message.reply_text(menu_text, reply_markup=reply_markup, parse_mode="Markdown")
+            try:
+                await message.delete()
+            except Exception:
+                pass
+        else:
+            await message.edit_text(menu_text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
-        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await message.reply_text(menu_text, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def display_feedback_card(message, fb_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT user_id, user_name, username, feedback_text, photo_file_id, created_at FROM feedback_reports WHERE id = %s", (fb_id,))
+            cursor.execute(
+                "SELECT user_id, user_name, username, feedback_text, photo_file_id, created_at FROM feedback_reports WHERE id = %s",
+                (fb_id,)
+            )
             row = cursor.fetchone()
+
     if not row:
         await message.reply_text("Report not found.")
         return
+
     uid, uname, u_handle, fb_text, photo_id, dt = row
-    card = f"💡 **Feedback: #{fb_id}**\n\n• **From:** {html.escape(uname)} (@{u_handle})\n• **Date:** {dt}\n\n**Idea:**\n{html.escape(fb_text)}"
-    kb = [[InlineKeyboardButton("✅ Mark Reviewed", callback_data=f"adm_fb_dismiss_{fb_id}")], [InlineKeyboardButton("⬅ Back to Queue", callback_data="adm_view_feedbacks")]]
+    card = (
+        f"💡 **Feedback / Suggestion: #{fb_id}**\n\n"
+        f"• **From:** {html.escape(uname)} (@{u_handle})\n"
+        f"• **User ID:** `{uid}`\n"
+        f"• **Submitted:** {dt}\n\n"
+        f"**Idea / Thoughts:**\n{html.escape(fb_text)}"
+    )
+
+    kb = [
+        [InlineKeyboardButton("✅ Mark Reviewed", callback_data=f"adm_fb_dismiss_{fb_id}")],
+        [InlineKeyboardButton("⬅ Back to Queue", callback_data="adm_view_feedbacks")]
+    ]
+    reply_markup = InlineKeyboardMarkup(kb)
+
     if photo_id:
-        await context.bot.send_photo(chat_id=message.chat_id, photo=photo_id, caption=card, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await context.bot.send_photo(
+            chat_id=message.chat_id,
+            photo=photo_id,
+            caption=card,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
     else:
-        await message.reply_text(card, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await message.reply_text(card, reply_markup=reply_markup, parse_mode="Markdown")
 
 @rate_limit
 async def admin_feedbacks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1229,37 +1717,81 @@ async def admin_feedbacks_command(update: Update, context: ContextTypes.DEFAULT_
 async def show_admin_support_menu(message, context: ContextTypes.DEFAULT_TYPE, is_edit=False) -> None:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, user_name, created_at FROM support_tickets WHERE status = 'pending' ORDER BY id DESC LIMIT 10")
+            cursor.execute(
+                "SELECT id, user_name, created_at FROM support_tickets WHERE status = 'pending' ORDER BY id DESC LIMIT 10"
+            )
             rows = cursor.fetchall()
+
+    empty_text = "✅ **No Pending Support Tickets**\n\nAll reported issues have been resolved."
+
     if not rows:
-        empty = "✅ **No Pending Support Tickets**"
-        if is_edit and message.text:
-            await message.edit_text(empty, parse_mode="Markdown")
+        if is_edit:
+            if message.photo:
+                await message.edit_caption(caption=empty_text, parse_mode="Markdown")
+            else:
+                await message.edit_text(empty_text, parse_mode="Markdown")
         else:
-            await message.reply_text(empty, parse_mode="Markdown")
+            await message.reply_text(empty_text, parse_mode="Markdown")
         return
-    keyboard = [[InlineKeyboardButton(f"#{r[0]}: {r[1][:15]}", callback_data=f"adm_sp_item_{r[0]}")] for r in rows]
-    text = f"🛠️ **Pending Support Tickets ({len(rows)})**"
-    if is_edit and message.text:
-        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    keyboard = []
+    for ticket_id, user_name, created_at in rows:
+        btn_text = f"#{ticket_id}: {user_name[:15]}"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"adm_sp_item_{ticket_id}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    menu_text = f"🛠️ **Pending Support Tickets ({len(rows)})**\nSelect any bug ticket to inspect:"
+
+    if is_edit:
+        if message.photo:
+            await message.reply_text(menu_text, reply_markup=reply_markup, parse_mode="Markdown")
+            try:
+                await message.delete()
+            except Exception:
+                pass
+        else:
+            await message.edit_text(menu_text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
-        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await message.reply_text(menu_text, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def display_support_card(message, ticket_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT user_id, user_name, username, issue_text, photo_file_id, created_at FROM support_tickets WHERE id = %s", (ticket_id,))
+            cursor.execute(
+                "SELECT user_id, user_name, username, issue_text, photo_file_id, created_at FROM support_tickets WHERE id = %s",
+                (ticket_id,)
+            )
             row = cursor.fetchone()
+
     if not row:
         await message.reply_text("Ticket not found.")
         return
+
     uid, uname, u_handle, issue_text, photo_id, dt = row
-    card = f"🛠️ **Support Ticket: #{ticket_id}**\n\n• **From:** {html.escape(uname)} (@{u_handle})\n• **Date:** {dt}\n\n**Issue:**\n{html.escape(issue_text)}"
-    kb = [[InlineKeyboardButton("✅ Mark Resolved", callback_data=f"adm_sp_dismiss_{ticket_id}")], [InlineKeyboardButton("⬅ Back to Tickets", callback_data="adm_view_support")]]
+    card = (
+        f"🛠️ **Bug / Support Ticket: #{ticket_id}**\n\n"
+        f"• **From:** {html.escape(uname)} (@{u_handle})\n"
+        f"• **User ID:** `{uid}`\n"
+        f"• **Submitted:** {dt}\n\n"
+        f"**Defect Details:**\n{html.escape(issue_text)}"
+    )
+
+    kb = [
+        [InlineKeyboardButton("✅ Mark Resolved", callback_data=f"adm_sp_dismiss_{ticket_id}")],
+        [InlineKeyboardButton("⬅ Back to Tickets", callback_data="adm_view_support")]
+    ]
+    reply_markup = InlineKeyboardMarkup(kb)
+
     if photo_id:
-        await context.bot.send_photo(chat_id=message.chat_id, photo=photo_id, caption=card, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await context.bot.send_photo(
+            chat_id=message.chat_id,
+            photo=photo_id,
+            caption=card,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
     else:
-        await message.reply_text(card, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await message.reply_text(card, reply_markup=reply_markup, parse_mode="Markdown")
 
 @rate_limit
 async def admin_support_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1273,36 +1805,59 @@ async def test_refund_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.effective_user.id != ADMIN_USER_ID:
         await update.message.reply_text("⛔ Unauthorized.")
         return
+
     dummy_charge_id = f"TEST_{int(time.time())}"
+    dummy_user_id = ADMIN_USER_ID
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO refund_requests (user_id, user_name, username, charge_id, amount_stars, reason, photo_file_id, status, created_at) VALUES (%s, %s, %s, %s, %s, %s, NULL, 'pending', %s) RETURNING id",
-                (ADMIN_USER_ID, "Test User", "testaccount", dummy_charge_id, 100, "Automated test: Testing dismiss flow.", timestamp)
+                """
+                INSERT INTO refund_requests 
+                (user_id, user_name, username, charge_id, amount_stars, reason, photo_file_id, status, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NULL, 'pending', %s)
+                RETURNING id
+                """,
+                (dummy_user_id, "Test User", "testaccount", dummy_charge_id, 100, "Automated test: Testing dismiss flow and customer notifications.", timestamp)
             )
             req_id = cursor.fetchone()[0]
-    await update.message.reply_text(f"🧪 Dummy refund request (`#{req_id}`) logged.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 View Pending Refunds", callback_data="adm_view_refunds")]]))
 
+    pending_count = get_pending_refund_count()
+    admin_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📋 View Pending Refunds ({pending_count})", callback_data="adm_view_refunds")]
+    ])
+
+    await update.message.reply_text(
+        f"🧪 **[TEST MOCK GENERATED]**\n\n"
+        f"A dummy refund request (`#{req_id}`) has been logged!\n"
+        f"• Queue count is now: **{pending_count}**\n\n"
+        "Tap below to test approving or dismissing (fast or custom reason):",
+        reply_markup=admin_kb,
+        parse_mode="Markdown"
+    )
+
+# --- BOT COMMANDS MENU CONFIGURATION (CLICK-TO-USE ONLY) ---
 async def set_bot_commands(application: Application) -> None:
     commands = [
-        BotCommand("start", "Start bot and view guide"),
-        BotCommand("numeric", "Generate 8-digit numeric key"),
-        BotCommand("alphanumeric", "Generate 8-digit alphanumeric key"),
-        BotCommand("status", "Check quota & subscription"),
-        BotCommand("subscribe", "Get 30 days unlimited credits"),
-        BotCommand("paysupport", "Payment assistance & refund requests"),
-        BotCommand("support", "Report a bug or technical issue"),
-        BotCommand("feedback", "Share ideas & feature suggestions"),
-        BotCommand("export_my_data", "Export saved keys for this chat"),
-        BotCommand("delete_all_my_data", "Wipe all saved keys"),
+        BotCommand("start", "Start bot and view quick-start guide"),
+        BotCommand("numeric", "Generate an 8-digit numeric passkey"),
+        BotCommand("alphanumeric", "Generate an 8-digit alphanumeric key"),
+        BotCommand("status", "Check credits & subscription expiry"),
+        BotCommand("subscribe", "Get unlimited credits for 30 days"),
+        BotCommand("paysupport", "Refund requests for Telegram Stars"),
+        BotCommand("support", "Report a technical bug or system defect"),
+        BotCommand("feedback", "Suggest features or share your experience"),
+        BotCommand("export_my_data", "Export saved keys for current chat"),
+        BotCommand("delete_all_my_data", "Wipe all your saved keys"),
         BotCommand("help", "Help guide and support buttons"),
     ]
     await application.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     error = context.error
-    logger.error("Error while handling update", exc_info=error)
+    logger.error("Error while handling an update", exc_info=error)
+
     if isinstance(error, DecryptionError) and isinstance(update, Update):
         try:
             if update.callback_query:
@@ -1310,7 +1865,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             elif update.effective_message:
                 await update.effective_message.reply_text(DECRYPT_FAIL_MESSAGE)
         except Exception:
-            pass
+            logger.exception("Could not send the decryption error message to the user")
 
 # --- MINI APP WEB HANDLERS ---
 async def mini_app_index(request: web.Request) -> web.Response:
@@ -1338,13 +1893,14 @@ async def mini_app_api_vault(request: web.Request) -> web.Response:
 
 def main() -> None:
     if not TOKEN:
-        raise ValueError("TELEGRAM_TOKEN not found!")
+        raise ValueError("TELEGRAM_TOKEN not found in environment variables!")
+    
     init_connection_pool()
     init_db()
 
     application = Application.builder().token(TOKEN).post_init(set_bot_commands).build()
 
-    # User Command Handlers
+    # Public User Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("numeric", generate_numeric))
     application.add_handler(CommandHandler("alphanumeric", generate_alphanumeric))
@@ -1361,22 +1917,25 @@ def main() -> None:
     application.add_handler(CommandHandler("support", support_command))
     application.add_handler(CommandHandler("help", help_command))
 
-    # Secret Admin Command Handlers
+    # Secret Admin Handlers
     application.add_handler(CommandHandler("admin_refunds", admin_refunds_command))
     application.add_handler(CommandHandler("admin_feedbacks", admin_feedbacks_command))
     application.add_handler(CommandHandler("admin_support", admin_support_command))
     application.add_handler(CommandHandler("test_refund", test_refund_command))
 
-    # Interactive Callbacks & Payments
+    # Handlers for Buttons & Payments
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    
+    # Message listeners for feedback, support tickets, and admin rejection notes
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_submission))
     application.add_handler(MessageHandler(filters.PHOTO, handle_user_submission))
+
     application.add_handler(InlineQueryHandler(inline_query_handler))
     application.add_error_handler(error_handler)
 
-    # Combined runner for Bot (polling/webhook) + Mini App (web)
+    # Combined runner for Telegram Bot + Mini App Web Server
     async def start_all():
         await application.initialize()
         await application.start()
