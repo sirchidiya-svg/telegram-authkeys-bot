@@ -1,0 +1,34 @@
+# Changelog
+
+All notable changes to the AuthKeys Bot project starting from the Telegram Mini App (TMA) transition and Guest Mode development are documented below.
+
+## [2.0.0] - 2026-10-05
+
+### Added
+- **Telegram Mini App Dashboard (`templates/index.html`)**:
+  - Embedded responsive web interface built with Tailwind CSS and Telegram WebApp SDK (`telegram-web-app.js`).
+  - **Dynamic User Detection & Guest Mode**: Automatically reads authenticated Telegram session metadata (`user.username` / `user.first_name`), with a fallback `"Guest Mode"` badge for unverified sessions.
+  - **Interactive Key Generator**: Configurable length slider (6–32 characters), character set toggles (Numbers, Letters), 1-tap clipboard copying, and native Telegram tactile feedback (`HapticFeedback`).
+  - **In-App Encrypted Vault Viewer**: Dynamically fetches and displays the user's decrypted saved credentials without leaving the webview.
+  - **"Save to Vault" Modal & Pipeline**: Added in-app modal enabling users to assign titles and descriptive notes to newly generated keys and commit them directly to the database.
+- **Unified Backend Web Server (`aiohttp`)**:
+  - Embedded asynchronous web runner directly inside `app.py` sharing the same runtime loop as `python-telegram-bot`.
+  - Added HTTP route `GET /` to serve the static dashboard.
+  - Added JSON API route `GET /api/vault` to query and return encrypted user keys.
+  - Added JSON API route `POST /api/save_key` to receive, validate, encrypt, and persist credentials generated in the Mini App.
+- **Cryptographic Authentication**:
+  - Added `validate_telegram_data()` to verify Telegram `initData` signatures using HMAC-SHA256 against `TELEGRAM_TOKEN`, preventing request forgery.
+- **Persistent Access Points**:
+  - Registered persistent header menu button (`MenuButtonWebApp`) labeled `"Open App"`.
+  - Restructured `/start` and `/help` keyboards with a dedicated full-width `[🚀 Open App ▢]` button on Row 2 featuring the Telegram native webview launcher icon.
+
+### Changed
+- Replaced separate web server requirements by unifying bot polling and web routing on Railway's assigned dynamic `PORT`.
+- Updated `requirements.txt` to include `aiohttp` alongside existing cryptography, database, and bot packages.
+- Added hardcoded fallback `DEFAULT_MINI_APP_URL` to guarantee Mini App buttons render cleanly even if Railway environment variables fail to load.
+
+### Preserved Core Systems
+- Maintained zero-knowledge Fernet (AES-128-CBC) encryption-at-rest for all credentials.
+- Preserved PostgreSQL connection pooling (`psycopg2.pool.ThreadedConnectionPool`).
+- Retained full administrative suites (`/admin_refunds`, `/admin_support`, `/admin_feedbacks`, and mock sandbox `/test_refund`).
+- Maintained Telegram Stars payment infrastructure, quota limits, and 7-day trial tracking.
